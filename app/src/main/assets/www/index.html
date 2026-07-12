@@ -4,9 +4,9 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
 <title>NFC Vault</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="lib/react.production.min.js"></script>
+<script src="lib/react-dom.production.min.js"></script>
+<script src="lib/babel.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -28,20 +28,81 @@ input{font-family:inherit}
 const{useState,useEffect,useRef,useCallback}=React;
 const STORAGE_KEY="nfc_saved_cards";
 
-// ── Storage helpers ──
-async function loadCards(){try{const r=await window.storage?.get(STORAGE_KEY);return r?JSON.parse(r.value):[]}catch{return JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]")}}
-async function persistCards(cards){try{await window.storage?.set(STORAGE_KEY,JSON.stringify(cards))}catch{localStorage.setItem(STORAGE_KEY,JSON.stringify(cards))}}
+// ══════════════════════════════════════════════════════
+//  PERSISTENT STORAGE — uses NfcBridge.saveData/loadData
+//  for reliable SharedPreferences storage on Android,
+//  falls back to localStorage for browser/demo mode.
+// ══════════════════════════════════════════════════════
+const nativeBridge=typeof window.NfcBridge!=="undefined";
+
+function loadCards(){
+  try{
+    if(nativeBridge){
+      const raw=window.NfcBridge.loadData(STORAGE_KEY);
+      if(raw&&raw.length>0)return JSON.parse(raw);
+      // Migrate from localStorage if any
+      const ls=localStorage.getItem(STORAGE_KEY);
+      if(ls){
+        const cards=JSON.parse(ls);
+        window.NfcBridge.saveData(STORAGE_KEY,ls);
+        localStorage.removeItem(STORAGE_KEY);
+        return cards;
+      }
+      return[];
+    }
+    return JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]");
+  }catch(e){
+    console.error("loadCards error",e);
+    return[];
+  }
+}
+
+function persistCards(cards){
+  try{
+    const json=JSON.stringify(cards);
+    if(nativeBridge){
+      window.NfcBridge.saveData(STORAGE_KEY,json);
+    }
+    localStorage.setItem(STORAGE_KEY,json);
+  }catch(e){
+    console.error("persistCards error",e);
+  }
+}
 
 // ── Utilities ──
 function hex(n){return n.toString(16).toUpperCase().padStart(2,"0")}
 function rnd(){return Math.floor(Math.random()*256)}
+function copyText(t){
+  const s=String(t==null?"":t);
+  try{
+    if(nativeBridge&&window.NfcBridge.copyToClipboard){window.NfcBridge.copyToClipboard(s);return true}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(s);return true}
+    const ta=document.createElement("textarea");ta.value=s;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);return true;
+  }catch(e){return false}
+}
+function downloadJson(filename,obj){
+  try{
+    const json=typeof obj==="string"?obj:JSON.stringify(obj,null,2);
+    const blob=new Blob([json],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);
+    return true;
+  }catch(e){return false}
+}
+function cardHasNdef(c){return !!(c&&(c.ndefMessageHex||(c.ndefRecords&&c.ndefRecords.length>0)))}
 
 // ── Card-type color + label mapping ──
 const CARD_TYPES={
   mifare_classic:{label:"MIFARE Classic",color:"#00f5d4",icon:"🔑"},
+  mifare_plus:{label:"MIFARE Plus",color:"#00e0b0",icon:"🔐"},
   mifare_ultralight:{label:"NTAG / Ultralight",color:"#7B61FF",icon:"🏷️"},
+  desfire:{label:"DESFire",color:"#E040FB",icon:"🛡️"},
+  emv:{label:"EMV Payment",color:"#FFD700",icon:"💳"},
   ndef:{label:"NDEF",color:"#00BFFF",icon:"📝"},
+  ndef_formatable:{label:"NDEF Formatable",color:"#5599CC",icon:"📋"},
   isodep:{label:"ISO-DEP",color:"#FF6B6B",icon:"💳"},
+  nfc_barcode:{label:"NFC Barcode",color:"#B0FF57",icon:"📊"},
   nfcv:{label:"NFC-V",color:"#FFB800",icon:"📦"},
   nfcf:{label:"FeliCa",color:"#FF69B4",icon:"🚃"},
   nfca:{label:"NFC-A",color:"#4ECDC4",icon:"📡"},
@@ -54,56 +115,96 @@ function getCardMeta(card){
   return CARD_TYPES[ct]||CARD_TYPES.generic;
 }
 
-// ── Demo card generator with random types ──
+// ── Demo card generator ──
 function demoCard(){
-  const types=["mifare_classic","mifare_ultralight","ndef","isodep","nfcv","nfcf"];
+  const types=["mifare_classic","mifare_ultralight","ndef","isodep","nfcv","nfcf","desfire","emv","nfc_barcode"];
   const pick=types[Math.floor(Math.random()*types.length)];
   const id=Date.now().toString(36);
   const serial=Array.from({length:4},()=>hex(rnd())).join(":");
   const base={id,name:"Card "+new Date().toLocaleTimeString(),scannedAt:new Date().toISOString(),serial,rawId:serial.replace(/:/g,""),cardType:pick};
-
   if(pick==="mifare_classic"){
     base.tagType="MIFARE Classic 1K";base.manufacturer="NXP - MIFARE Classic 1K";
     base.technologies=["NfcA","MifareClassic","NdefFormatable"];
     base.atqa="0x0004";base.sak="0x08";
     base.memory={total:1024,sectors:16,blocksPerSector:4,bytesPerBlock:16};
     base.sectors=Array.from({length:16},(_,s)=>({sector:s,accessible:Math.random()>0.15,blocks:Array.from({length:4},(_,b)=>({block:s*4+b,isTrailer:b===3,data:Array.from({length:16},()=>hex(rnd())).join(" ")}))}));
-  } else if(pick==="mifare_ultralight"){
+  }else if(pick==="mifare_ultralight"){
     base.tagType="NTAG 215";base.manufacturer="NXP Semiconductors";
     base.technologies=["NfcA","MifareUltralight","Ndef"];
     base.atqa="0x4400";base.sak="0x00";base.totalPages=20;
     base.pages=Array.from({length:20},(_,p)=>({page:p,data:Array.from({length:4},()=>hex(rnd())).join(" ")}));
     base.ndefRecords=[{recordType:"URI",decoded:"https://example.com",payloadSize:16}];
-  } else if(pick==="ndef"){
+  }else if(pick==="ndef"){
     base.tagType="NDEF";base.manufacturer="NXP Semiconductors";
     base.technologies=["NfcA","Ndef"];base.ndefType="org.nfcforum.ndef.type2";
     base.maxSize=504;base.isWritable=true;base.messageSize=42;
     base.ndefRecords=[{recordType:"URI",decoded:"https://nfcvault.app",payloadSize:18},{recordType:"TEXT",decoded:"Hello NFC World!",payloadSize:20}];
-  } else if(pick==="isodep"){
+  }else if(pick==="isodep"){
     base.tagType="ISO-DEP / Smart Card";base.manufacturer="NXP Semiconductors";
     base.technologies=["NfcA","IsoDep"];base.atqa="0x0004";base.sak="0x20";
     base.historicalBytes=Array.from({length:12},()=>hex(rnd())).join(" ");
     base.maxTransceiveLength=253;base.timeout=2000;
     base.apdus=[{command:"SELECT (no AID)",sent:"00 A4 04 00 00",response:Array.from({length:8},()=>hex(rnd())).join(" "),sw:"9000"}];
-  } else if(pick==="nfcv"){
-    base.tagType="NFC-V / ISO 15693";base.manufacturer="STMicroelectronics";
+  }else if(pick==="nfcv"){
+    base.tagType="ICODE SLIX2";base.manufacturer="NXP Semiconductors";
     base.technologies=["NfcV"];base.dsfId="0x00";base.responseFlags="0x00";
-    base.totalBlocks=16;
+    base.totalBlocks=80;base.blockSize=4;base.totalMemory="320 bytes";
+    base.icReference="0x45";base.afi="0x00";
     base.blocks=Array.from({length:16},(_,i)=>({block:i,data:Array.from({length:4},()=>hex(rnd())).join(" ")}));
-  } else if(pick==="nfcf"){
+  }else if(pick==="nfcf"){
     base.tagType="NFC-F / FeliCa";base.manufacturer="Sony";
     base.technologies=["NfcF"];
     base.idm=Array.from({length:8},()=>hex(rnd())).join(" ");
     base.pmm=Array.from({length:8},()=>hex(rnd())).join(" ");
-    base.systemCode="88 B4";base.maxTransceiveLength=252;
+    base.systemCode="88 B4";base.felicaSystem="NDEF on FeliCa";
+    base.maxTransceiveLength=252;
+  }else if(pick==="desfire"){
+    base.tagType="MIFARE DESFire EV2";base.manufacturer="NXP Semiconductors";
+    base.technologies=["NfcA","IsoDep"];base.atqa="0x0344";base.sak="0x20";
+    base.desfireVersion={hardwareVendor:"NXP",hardwareType:"0x01",hardwareVersion:"1.0",storageSize:"8 KB",protocol:"ISO 14443-3/4",softwareVersion:Array.from({length:7},()=>hex(rnd())).join(" ")};
+    base.desfireApplications=["000001","F54321","AABB00"];
+    base.apdus=[{command:"DESFire GET_VERSION",sent:"90 60 00 00 00",response:"04 01 01 01 00 1A 05 91 AF",sw:"91AF"}];
+  }else if(pick==="emv"){
+    const nets=["Visa","Mastercard","American Express"];
+    const net=nets[Math.floor(Math.random()*nets.length)];
+    base.tagType=net+" Contactless";base.manufacturer="Payment Card";
+    base.technologies=["NfcA","IsoDep"];base.atqa="0x0004";base.sak="0x20";
+    base.paymentNetwork=net;
+    base.emvApplications=[{aid:net==="Visa"?"A0000000031010":net==="Mastercard"?"A0000000041010":"A000000025010801",network:net,applicationLabel:net}];
+    base.apdus=[{command:"SELECT PPSE",sent:"00 A4 04 00 0E 32 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00",response:Array.from({length:20},()=>hex(rnd())).join(" ")+" 90 00",sw:"9000"}];
+  }else if(pick==="nfc_barcode"){
+    base.tagType="NFC Barcode (Kovio)";base.manufacturer="Kovio";
+    base.technologies=["NfcBarcode"];
+    base.barcodeType="Kovio";
+    base.barcodeHex=Array.from({length:16},()=>hex(rnd())).join(" ");
+    base.barcodeLength=16;
+    base.barcodeAscii="KOVIO-"+Math.floor(Math.random()*99999);
   }
   return base;
 }
 
-// ── NFC Callbacks ──
+// ══════════════════════════════════════════════════════
+//  NFC CALLBACKS — handles BOTH manual scan + auto-scan
+//  when user taps a card without pressing "Scan" first
+// ══════════════════════════════════════════════════════
+// Global event bus for card reads from native side
+const cardEventListeners=[];
+function onCardEvent(cb){cardEventListeners.push(cb);return()=>{const i=cardEventListeners.indexOf(cb);if(i>=0)cardEventListeners.splice(i,1)}}
+
 window.NfcCallbacks={
-  onCardRead:(j)=>{try{window.__nfcRR&&window.__nfcRR(JSON.parse(j))}catch(e){console.error("onCardRead parse error",e)}},
-  onReadError:(m)=>{window.__nfcRE&&window.__nfcRE(m)},
+  onCardRead:(j)=>{
+    try{
+      const card=JSON.parse(j);
+      // If a manual scan callback is waiting, use it
+      if(window.__nfcRR){window.__nfcRR(card);window.__nfcRR=null;return}
+      // Otherwise fire to the global event bus (auto-scan)
+      cardEventListeners.forEach(cb=>cb(card));
+    }catch(e){console.error("onCardRead parse error",e)}
+  },
+  onReadError:(m)=>{
+    if(window.__nfcRE){window.__nfcRE(m);window.__nfcRE=null;return}
+    cardEventListeners.forEach(cb=>cb(null,m));
+  },
   onWriteComplete:(j)=>{try{window.__nfcWD&&window.__nfcWD(JSON.parse(j))}catch(e){}},
   onWriteError:(m)=>{window.__nfcWE&&window.__nfcWE(m)}
 };
@@ -112,7 +213,7 @@ window.NfcCallbacks={
 const btnS=(c,sm=false)=>({background:c+"18",border:"1px solid "+c+"55",color:c,borderRadius:sm?8:10,padding:sm?"5px 12px":"9px 18px",fontSize:sm?11:12,fontFamily:"'IBM Plex Mono',monospace",transition:"all .15s"});
 const mono={fontFamily:"'IBM Plex Mono',monospace"};
 
-// ── Type Badge Component ──
+// ── Type Badge ──
 const TypeBadge=({card})=>{
   const meta=getCardMeta(card);
   return(<div style={{display:"inline-flex",alignItems:"center",gap:4,background:meta.color+"18",border:"1px solid "+meta.color+"40",borderRadius:6,padding:"2px 8px"}}>
@@ -215,6 +316,58 @@ const BlockGrid=({blocks})=>(<div style={{maxHeight:320,overflowY:"auto"}}>
   </div>))}
 </div>);
 
+// ── DESFire Detail ──
+const DESFireDetail=({card})=>{
+  const ver=card.desfireVersion||{};
+  const rows=[["HW Vendor",ver.hardwareVendor],["HW Type",ver.hardwareType],["HW Version",ver.hardwareVersion],["Storage",ver.storageSize],["Protocol",ver.protocol]];
+  if(ver.softwareVersion)rows.push(["SW Version",ver.softwareVersion]);
+  if(ver.productionInfo)rows.push(["Production",ver.productionInfo]);
+  return(<div>
+    <div style={{background:"#090f14",border:"1px solid #1a2830",borderRadius:10,overflow:"hidden",marginBottom:8}}>
+      {rows.map(([k,v],i)=>v&&(<div key={k} style={{display:"flex",padding:"9px 14px",borderBottom:i<rows.length-1?"1px solid #111e28":"none",gap:10}}>
+        <div style={{width:100,fontSize:10,color:"#E040FB",...mono,flexShrink:0}}>{k}</div>
+        <div style={{fontSize:11,color:"#d0a0e0",...mono,wordBreak:"break-all"}}>{v}</div>
+      </div>))}
+    </div>
+    {card.desfireApplications?.length>0&&<>
+      <div style={{fontSize:10,color:"#E040FB80",...mono,marginBottom:4}}>APPLICATIONS ({card.desfireApplications.length})</div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+        {card.desfireApplications.map(a=>(<span key={a} style={{background:"#E040FB12",border:"1px solid #E040FB30",borderRadius:6,padding:"3px 10px",fontSize:10,color:"#E040FB",...mono}}>AID: {a}</span>))}
+      </div>
+    </>}
+  </div>);
+};
+
+// ── EMV Payment Detail ──
+const EmvDetail=({card})=>(<div>
+  {card.paymentNetwork&&<div style={{textAlign:"center",marginBottom:10}}>
+    <div style={{display:"inline-block",background:"linear-gradient(135deg,#FFD70020,#FFA50010)",border:"1px solid #FFD70040",borderRadius:10,padding:"8px 20px"}}>
+      <div style={{fontSize:18,fontWeight:700,color:"#FFD700",...mono}}>{card.paymentNetwork}</div>
+      <div style={{fontSize:9,color:"#b08800",...mono}}>Contactless Payment Card</div>
+    </div>
+  </div>}
+  {card.emvApplications?.length>0&&<>
+    <div style={{fontSize:10,color:"#FFD70080",...mono,marginBottom:6,letterSpacing:1}}>APPLICATIONS ({card.emvApplications.length})</div>
+    {card.emvApplications.map((a,i)=>(<div key={i} style={{background:"#090f14",border:"1px solid #1a2830",borderRadius:8,padding:"10px 14px",marginBottom:6}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+        <span style={{fontSize:10,color:"#FFD700",...mono,fontWeight:600}}>{a.network||"Unknown"}</span>
+        {a.applicationLabel&&<span style={{fontSize:9,color:"#b08800",...mono}}>{a.applicationLabel}</span>}
+      </div>
+      <div style={{fontSize:10,color:"#a09000",...mono,wordBreak:"break-all"}}>AID: {a.aid}</div>
+    </div>))}
+  </>}
+</div>);
+
+// ── Barcode Detail ──
+const BarcodeDetail=({card})=>(<div style={{background:"#090f14",border:"1px solid #1a2830",borderRadius:10,overflow:"hidden"}}>
+  {[["Type",card.barcodeType],["Hex",card.barcodeHex],["Length",card.barcodeLength+" bytes"],["ASCII",card.barcodeAscii]].map(([k,v],i)=>v!=null&&(
+    <div key={k} style={{display:"flex",padding:"9px 14px",borderBottom:i<3?"1px solid #111e28":"none",gap:10}}>
+      <div style={{width:60,fontSize:10,color:"#B0FF57",...mono,flexShrink:0}}>{k}</div>
+      <div style={{fontSize:11,color:"#a0e040",...mono,wordBreak:"break-all"}}>{String(v)}</div>
+    </div>
+  ))}
+</div>);
+
 // ── FeliCa Detail ──
 const FeliCaDetail=({card})=>(<div style={{background:"#090f14",border:"1px solid #1a2830",borderRadius:10,overflow:"hidden"}}>
   {[["IDm",card.idm],["PMm",card.pmm],["System Code",card.systemCode],["Max Transceive",card.maxTransceiveLength+"B"]].map(([k,v],i)=>v&&(
@@ -236,17 +389,18 @@ const RawHexDump=({card})=>{
 // ════════════════════════════════════════════════════
 //  DETAIL PANEL — renders data based on card type
 // ════════════════════════════════════════════════════
-function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
+function DetailPanel({card,onSave,onWrite,onRename,onExport,onEmulate,isEmulating,showActions=true}){
   const[expanded,setExpanded]=useState({});
   const[showRaw,setShowRaw]=useState(false);
   const[editName,setEditName]=useState(false);
   const[nameVal,setNameVal]=useState(card.name);
+  const[copied,setCopied]=useState(null);
   const nameRef=useRef();
   const meta=getCardMeta(card);
 
   useEffect(()=>{if(editName&&nameRef.current)nameRef.current.focus()},[editName]);
+  useEffect(()=>{setNameVal(card.name)},[card.name]);
 
-  // Build info fields based on card type
   const fields=[];
   fields.push(["Tag Type",card.tagType]);
   if(card.manufacturer)fields.push(["Manufacturer",card.manufacturer]);
@@ -280,7 +434,7 @@ function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
             <button onClick={()=>setEditName(false)} style={btnS("#ff4444",true)}>✕</button>
           </div>
         ):(
-          <div style={{fontSize:14,fontWeight:700,color:meta.color,...mono,cursor:"pointer"}} onClick={()=>{setNameVal(card.name);setEditName(true)}}>
+          <div style={{fontSize:14,fontWeight:700,color:meta.color,...mono,cursor:"pointer",flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} onClick={()=>{setNameVal(card.name);setEditName(true)}}>
             {card.name} <span style={{fontSize:11,opacity:.4}}>✎</span>
           </div>
         )}
@@ -292,23 +446,28 @@ function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
     {/* Info Fields */}
     <div style={{background:"#090f14",border:"1px solid #1a2830",borderRadius:12,overflow:"hidden",marginBottom:12}}>
       {fields.map(([k,v],i)=>(
-        <div key={k} style={{display:"flex",padding:"9px 14px",borderBottom:i<fields.length-1?"1px solid #111e28":"none",gap:10}}>
+        <div key={k} style={{display:"flex",padding:"9px 14px",borderBottom:i<fields.length-1?"1px solid #111e28":"none",gap:10,alignItems:"flex-start"}}>
           <div style={{width:90,fontSize:10,color:"#4a6070",...mono,flexShrink:0,paddingTop:1}}>{k}</div>
-          <div style={{fontSize:11,color:"#a0c8d0",...mono,wordBreak:"break-all"}}>{String(v)}</div>
+          <div style={{fontSize:11,color:"#a0c8d0",...mono,wordBreak:"break-all",flex:1}}>{String(v)}</div>
+          <span onClick={()=>{copyText(v);setCopied(k);setTimeout(()=>setCopied(null),1000)}} title="Copy" style={{cursor:"pointer",fontSize:10,color:copied===k?"#00f5d4":"#2a4050",flexShrink:0,userSelect:"none"}}>{copied===k?"✓":"⧉"}</span>
         </div>
       ))}
     </div>
 
     {/* Action Buttons */}
-    {showActions&&<div style={{display:"flex",gap:8,marginBottom:14}}>
-      {onSave&&<button onClick={()=>onSave(card)} style={{...btnS("#00f5d4"),flex:1,padding:"10px",textAlign:"center"}}>💾 Save</button>}
-      {canWrite&&onWrite&&<button onClick={()=>onWrite(card)} style={{...btnS("#ffb800"),flex:1,padding:"10px",textAlign:"center"}}>✍️ Write</button>}
+    {showActions&&<div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+      {onSave&&<button onClick={()=>onSave(card)} style={{...btnS("#00f5d4"),flex:1,padding:"10px",textAlign:"center",minWidth:80}}>💾 Save</button>}
+      {canWrite&&onWrite&&<button onClick={()=>onWrite(card)} style={{...btnS("#ffb800"),flex:1,padding:"10px",textAlign:"center",minWidth:80}}>✍️ Clone</button>}
+      {onExport&&<button onClick={()=>onExport(card)} style={{...btnS("#7B61FF"),flex:1,padding:"10px",textAlign:"center",minWidth:80}}>📤 Export</button>}
+      {onEmulate&&cardHasNdef(card)&&<button onClick={()=>onEmulate(card)} style={{...btnS(isEmulating?"#ff4444":"#e040fb"),flex:1,padding:"10px",textAlign:"center",minWidth:80}}>
+        {isEmulating ? "⏹ Stop Emulating" : "📡 Emulate"}
+      </button>}
     </div>}
 
     {/* Card-Type Specific Data */}
     {card.cardType==="mifare_classic"&&card.sectors?.length>0&&<>
       <div style={{fontSize:10,color:"#4a6070",...mono,marginBottom:6,letterSpacing:1}}>SECTORS ({card.sectors.length})</div>
-      <div style={{maxHeight:320,overflowY:"auto",marginBottom:12}}>
+      <div style={{maxHeight:400,overflowY:"auto",marginBottom:12}}>
         {card.sectors.map(s=>(<SectorRow key={s.sector} sector={s} expanded={!!expanded[s.sector]} toggle={()=>setExpanded(e=>({...e,[s.sector]:!e[s.sector]}))}/>))}
       </div>
     </>}
@@ -331,6 +490,23 @@ function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
       <div style={{marginBottom:12}}/>
     </>}
 
+    {card.cardType==="desfire"&&<>
+      <div style={{fontSize:10,color:"#E040FB",...mono,marginBottom:6,letterSpacing:1}}>DESFIRE VERSION</div>
+      <DESFireDetail card={card}/>
+      <div style={{marginBottom:12}}/>
+    </>}
+
+    {card.cardType==="emv"&&<>
+      <EmvDetail card={card}/>
+      <div style={{marginBottom:12}}/>
+    </>}
+
+    {card.cardType==="nfc_barcode"&&<>
+      <div style={{fontSize:10,color:"#B0FF57",...mono,marginBottom:6,letterSpacing:1}}>BARCODE DATA</div>
+      <BarcodeDetail card={card}/>
+      <div style={{marginBottom:12}}/>
+    </>}
+
     {card.cardType==="nfcv"&&card.blocks?.length>0&&<>
       <div style={{fontSize:10,color:"#FFB800",...mono,marginBottom:6,letterSpacing:1}}>BLOCKS ({card.blocks.length})</div>
       <BlockGrid blocks={card.blocks}/>
@@ -340,6 +516,7 @@ function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
     {card.cardType==="nfcf"&&<>
       <div style={{fontSize:10,color:"#FF69B4",...mono,marginBottom:6,letterSpacing:1}}>FELICA DATA</div>
       <FeliCaDetail card={card}/>
+      {card.felicaSystem&&<div style={{fontSize:10,color:"#FF69B460",...mono,marginTop:4}}>System: {card.felicaSystem}</div>}
       <div style={{marginBottom:12}}/>
     </>}
 
@@ -352,6 +529,94 @@ function DetailPanel({card,onSave,onWrite,onRename,showActions=true}){
 }
 
 // ════════════════════════════════════════════════════
+//  NDEF COMPOSER — author & write NDEF data to a blank tag
+// ════════════════════════════════════════════════════
+const NDEF_PRESETS=[
+  {id:"uri",label:"URL / Link",icon:"🔗",placeholder:"https://example.com",hint:"Opens a website"},
+  {id:"text",label:"Text",icon:"📝",placeholder:"Hello NFC!",hint:"Plain UTF-8 note"},
+  {id:"tel",label:"Phone",icon:"📞",placeholder:"+1 555 010 1234",hint:"Prompts to call"},
+  {id:"mailto",label:"Email",icon:"✉️",placeholder:"hello@example.com",hint:"Opens a new email"},
+  {id:"geo",label:"Location",icon:"📍",placeholder:"37.7749,-122.4194",hint:"latitude,longitude"},
+  {id:"aar",label:"Android App",icon:"🤖",placeholder:"com.spotify.music",hint:"Launches / installs app"},
+  {id:"mime",label:"Custom MIME",icon:"🧩",placeholder:"BEGIN:VCARD…",hint:"e.g. text/vcard for contacts"},
+];
+function previewUri(type,value){
+  const v=(value||"").trim();
+  if(type==="uri")return v;
+  if(type==="tel")return "tel:"+v;
+  if(type==="mailto")return "mailto:"+v;
+  if(type==="geo")return "geo:"+v;
+  return null;
+}
+function NdefComposer({step,onWrite,onReset,writeResult}){
+  const[type,setType]=useState("uri");
+  const[value,setValue]=useState("");
+  const[lang,setLang]=useState("en");
+  const[mime,setMime]=useState("text/plain");
+  const preset=NDEF_PRESETS.find(p=>p.id===type)||NDEF_PRESETS[0];
+  const valid=value.trim().length>0;
+  const accent="#00BFFF";
+
+  const build=()=>{
+    const rec={type,value:value.trim()};
+    if(type==="text")rec.lang=(lang.trim()||"en");
+    if(type==="mime")rec.mime=(mime.trim()||"text/plain");
+    return[rec];
+  };
+  const prev=previewUri(type,value);
+
+  if(step==="writing")return(<div style={{textAlign:"center",paddingTop:40}}>
+    <div style={{width:70,height:70,margin:"0 auto 18px",border:"3px solid "+accent+"60",borderTopColor:accent,borderRadius:"50%",animation:"spin .8s linear infinite"}}/>
+    <div style={{fontSize:13,color:accent,...mono}}>Ready to write…</div>
+    <div style={{fontSize:11,color:"#3a5060",marginTop:6}}>Hold a blank / writable NFC tag near the device</div>
+    <button onClick={onReset} style={{marginTop:20,...btnS("#3a5060"),padding:"8px 20px"}}>Cancel</button>
+  </div>);
+
+  if(step==="done")return(<div style={{textAlign:"center",paddingTop:40,animation:"fadeSlide .3s ease"}}>
+    <div style={{width:72,height:72,margin:"0 auto 18px",background:"radial-gradient(circle,"+accent+"20,transparent)",border:"2px solid "+accent,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,color:accent}}>✓</div>
+    <div style={{fontSize:16,fontWeight:600,color:accent,marginBottom:6}}>Tag Written!</div>
+    <div style={{fontSize:11,color:"#3a5060",marginBottom:4}}>{writeResult?((writeResult.written||1)+" record · "+(writeResult.bytes||0)+" bytes → "+(writeResult.tag||"NDEF")):"NDEF data written successfully"}</div>
+    <button onClick={onReset} style={{...btnS(accent),padding:"11px 28px",marginTop:12}}>Write another</button>
+  </div>);
+
+  return(<div>
+    <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1,marginBottom:10}}>RECORD TYPE</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(96px,1fr))",gap:8,marginBottom:16}}>
+      {NDEF_PRESETS.map(p=>(
+        <button key={p.id} onClick={()=>{setType(p.id);setValue("")}} style={{background:type===p.id?accent+"18":"#0c1820",border:"1px solid "+(type===p.id?accent:"#1a2830"),borderRadius:10,padding:"10px 6px",display:"flex",flexDirection:"column",alignItems:"center",gap:4,transition:"all .15s"}}>
+          <span style={{fontSize:18}}>{p.icon}</span>
+          <span style={{fontSize:10,color:type===p.id?accent:"#7a90a0",...mono}}>{p.label}</span>
+        </button>
+      ))}
+    </div>
+
+    <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1,marginBottom:6}}>{preset.label.toUpperCase()}</div>
+    {type==="text"?
+      <textarea value={value} onChange={e=>setValue(e.target.value)} placeholder={preset.placeholder} rows={3} style={{width:"100%",background:"#0a1820",border:"1px solid #1a2830",borderRadius:10,color:"#c8d8e0",padding:"10px 12px",...mono,fontSize:13,outline:"none",resize:"vertical"}}/>
+    : <input value={value} onChange={e=>setValue(e.target.value)} placeholder={preset.placeholder} style={{width:"100%",background:"#0a1820",border:"1px solid #1a2830",borderRadius:10,color:"#c8d8e0",padding:"11px 12px",...mono,fontSize:13,outline:"none"}}/>}
+    <div style={{fontSize:10,color:"#3a5060",...mono,marginTop:6}}>{preset.hint}</div>
+
+    {type==="text"&&<div style={{marginTop:10}}>
+      <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1,marginBottom:6}}>LANGUAGE CODE</div>
+      <input value={lang} onChange={e=>setLang(e.target.value)} placeholder="en" style={{width:100,background:"#0a1820",border:"1px solid #1a2830",borderRadius:8,color:"#c8d8e0",padding:"8px 12px",...mono,fontSize:12,outline:"none"}}/>
+    </div>}
+    {type==="mime"&&<div style={{marginTop:10}}>
+      <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1,marginBottom:6}}>MIME TYPE</div>
+      <input value={mime} onChange={e=>setMime(e.target.value)} placeholder="text/plain" style={{width:"100%",background:"#0a1820",border:"1px solid #1a2830",borderRadius:8,color:"#c8d8e0",padding:"8px 12px",...mono,fontSize:12,outline:"none"}}/>
+    </div>}
+
+    {prev&&valid&&<div style={{marginTop:12,background:"#081018",border:"1px solid #12303e",borderRadius:8,padding:"8px 12px",fontSize:11,color:accent,...mono,wordBreak:"break-all"}}>→ {prev}</div>}
+
+    <button disabled={!valid} onClick={()=>onWrite(build())} style={{width:"100%",marginTop:16,background:valid?"linear-gradient(135deg,#00BFFF,#0090c0)":"#0c1820",color:valid?"#060c12":"#3a5060",borderRadius:12,padding:"13px",fontSize:13,fontWeight:700,boxShadow:valid?"0 0 20px #00BFFF40":"none",cursor:valid?"pointer":"not-allowed"}}>
+      ✍️ Write to Tag
+    </button>
+    <div style={{marginTop:12,fontSize:10,color:"#2a4050",...mono,lineHeight:1.7,textAlign:"center"}}>
+      Works on NDEF tags &amp; blank NTAG / Ultralight / MIFARE Classic (NDEF-formatable) stickers.
+    </div>
+  </div>);
+}
+
+// ════════════════════════════════════════════════════
 //  MAIN APP
 // ════════════════════════════════════════════════════
 function App(){
@@ -360,18 +625,62 @@ function App(){
   const[scannedCard,setScanned]=useState(null);
   const[savedCards,setSaved]=useState([]);
   const[selected,setSelected]=useState(null);
-  const[toast,setToast]=useState(null);
-  const[writeStep,setWriteStep]=useState("select");
   const[writeTarget,setWriteTarget]=useState(null);
-  const nativeNfc=typeof window.NfcBridge!=="undefined";
+  const[writeStep,setWriteStep]=useState("select"); // select -> confirm -> writing -> done
+  const[writeSub,setWriteSub]=useState("compose"); // compose (author NDEF) | clone (copy saved dump)
+  const[composeStep,setComposeStep]=useState("edit"); // edit -> writing -> done
+  const[writeResult,setWriteResult]=useState(null);
+  const[isEmulating,setIsEmulating]=useState(false);
+  const[nfcStatus,setNfcStatus]=useState(nativeBridge?"ready":"demo");
+  const[toast,setToast]=useState(null);
+  const[query,setQuery]=useState("");
+  const[filterType,setFilterType]=useState("all");
+  const importRef=useRef();
 
-  useEffect(()=>{loadCards().then(setSaved)},[]);
+  // Load saved cards on mount
+  useEffect(()=>{
+    const cards=loadCards();
+    setSaved(cards);
+  },[]);
 
-  const showToast=(msg,type="ok")=>{setToast({msg,type});setTimeout(()=>setToast(null),2500)};
+  // Auto-scan listener: when a card is tapped without pressing "Scan" first
+  useEffect(()=>{
+    if(!nativeBridge)return;
+    const unsub=onCardEvent((card,err)=>{
+      if(err){showToast("Error: "+err,"err");return}
+      if(!card)return;
+      card.id=Date.now().toString(36);
+      card.name=(card.tagType||"Card")+" "+new Date().toLocaleTimeString();
+      if(!card.scannedAt)card.scannedAt=new Date().toISOString();
+      if(!card.cardType)card.cardType="generic";
+      setScanned(card);
+      setScanning(false);
+      setTab("scan");
+      showToast("Card scanned!");
+    });
+    return unsub;
+  },[]);
+
+  // Check NFC status
+  useEffect(()=>{
+    if(nativeBridge){
+      try{
+        const enabled=window.NfcBridge.isNfcEnabled();
+        setNfcStatus(enabled?"ready":"disabled");
+      }catch(e){setNfcStatus("ready")}
+    }
+  },[]);
+
+  const toastTimer=useRef(null);
+  const showToast=(msg,type="ok")=>{
+    if(toastTimer.current)clearTimeout(toastTimer.current);
+    setToast({msg,type});
+    toastTimer.current=setTimeout(()=>setToast(null),2500);
+  };
 
   const startScan=()=>{
     setScanning(true);setScanned(null);
-    if(nativeNfc){
+    if(nativeBridge){
       window.NfcBridge.startReadMode();
       window.__nfcRR=(card)=>{
         card.id=Date.now().toString(36);
@@ -382,61 +691,153 @@ function App(){
         showToast("Card scanned!");window.__nfcRR=null;
       };
       window.__nfcRE=(msg)=>{setScanning(false);showToast("Error: "+msg,"err");window.__nfcRE=null};
-    } else {
+    }else{
       setTimeout(()=>{setScanned(demoCard());setScanning(false);showToast("Scanned (demo)")},2200);
     }
   };
 
-  const saveCard=async(card)=>{
+  const saveCard=(card)=>{
     const u=[card,...savedCards.filter(c=>c.id!==card.id)];
-    setSaved(u);await persistCards(u);showToast("Saved to library");
+    setSaved(u);persistCards(u);showToast("Saved to library");
   };
 
-  const deleteCard=async(id)=>{
-    const u=savedCards.filter(c=>c.id!==id);setSaved(u);await persistCards(u);
+  const emulateCard=(card)=>{
+    if(isEmulating){
+      if(window.NfcBridge&&window.NfcBridge.stopEmulation){
+        window.NfcBridge.stopEmulation();
+        setIsEmulating(false);
+        showToast("Emulation stopped");
+      }
+    }else{
+      if(window.NfcBridge&&window.NfcBridge.startEmulation){
+        window.NfcBridge.startEmulation(JSON.stringify(card));
+        setIsEmulating(true);
+        showToast("Emulating NDEF data...");
+      }
+    }
+  };
+
+  const deleteCard=(id)=>{
+    const u=savedCards.filter(c=>c.id!==id);setSaved(u);persistCards(u);
     if(selected?.id===id)setSelected(null);showToast("Deleted","err");
   };
 
-  const renameCard=async(card,newName)=>{
+  const renameCard=(card,newName)=>{
     if(!newName?.trim())return;
     const u=savedCards.map(c=>c.id===card.id?{...c,name:newName.trim()}:c);
-    setSaved(u);await persistCards(u);
-    if(selected?.id===card.id)setSelected(s=>({...s,name:newName.trim()}));
-    if(scannedCard?.id===card.id)setScanned(s=>({...s,name:newName.trim()}));
+    setSaved(u);persistCards(u);
+    if(selected?.id===card.id)setSelected(s=>s?{...s,name:newName.trim()}:s);
+    if(scannedCard?.id===card.id)setScanned(s=>s?{...s,name:newName.trim()}:s);
     showToast("Renamed");
   };
 
-  const goToWrite=(card)=>{setWriteTarget(card);setTab("write");setWriteStep("confirm")};
+  const exportCard=(card)=>{
+    try{
+      const json=JSON.stringify(card,null,2);
+      const blob=new Blob([json],{type:"application/json"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;a.download=(card.name||"card").replace(/[^a-zA-Z0-9]/g,"_")+".json";
+      a.click();URL.revokeObjectURL(url);
+      showToast("Exported!");
+    }catch(e){showToast("Export failed","err")}
+  };
+
+  const goToWrite=(card)=>{setWriteTarget(card);setTab("write");setWriteSub("clone");setWriteStep("confirm")};
+
+  // ── Author & write a fresh NDEF message to a tag ──
+  const writeNdefToTag=(records)=>{
+    if(nativeBridge){
+      const res=window.NfcBridge.startNdefWrite(JSON.stringify(records));
+      if(typeof res==="string"&&res.indexOf("ERR:")===0){
+        showToast("Invalid data: "+res.slice(4),"err");return;
+      }
+      setComposeStep("writing");
+      window.__nfcWD=(r)=>{setWriteResult(r);setComposeStep("done");showToast("Tag written ✓");window.__nfcWD=null};
+      window.__nfcWE=(m)=>{setComposeStep("edit");showToast("Write failed: "+m,"err");window.__nfcWE=null};
+    }else{
+      setComposeStep("writing");
+      setTimeout(()=>{setWriteResult({written:records.length,bytes:32,tag:"NDEF (demo)"});setComposeStep("done")},1600);
+    }
+  };
+  const resetCompose=()=>{
+    setComposeStep("edit");setWriteResult(null);
+    if(nativeBridge&&window.NfcBridge.cancelWrite)window.NfcBridge.cancelWrite();
+  };
+
+  // ── Import cards from an exported JSON file ──
+  const importCards=(e)=>{
+    const file=e.target.files&&e.target.files[0];
+    if(!file)return;
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        const parsed=JSON.parse(ev.target.result);
+        const incoming=Array.isArray(parsed)?parsed:[parsed];
+        let added=0;
+        const existing=[...savedCards];
+        incoming.forEach(c=>{
+          if(!c||typeof c!=="object")return;
+          c.id=Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+          if(!c.name)c.name=(c.tagType||"Imported Card");
+          if(!c.scannedAt)c.scannedAt=new Date().toISOString();
+          if(!c.cardType)c.cardType="generic";
+          existing.unshift(c);added++;
+        });
+        setSaved(existing);persistCards(existing);
+        showToast(added>0?("Imported "+added+" card"+(added>1?"s":"")):"Nothing to import",added>0?"ok":"err");
+      }catch(err){showToast("Import failed: bad JSON","err")}
+    };
+    reader.readAsText(file);
+    e.target.value="";
+  };
+  const exportAll=()=>{
+    if(savedCards.length===0){showToast("Library is empty","err");return}
+    downloadJson("nfc_vault_library_"+Date.now()+".json",savedCards)?showToast("Exported "+savedCards.length+" cards"):showToast("Export failed","err");
+  };
 
   const doWrite=(card)=>{
     setWriteStep("writing");
-    if(nativeNfc){
+    if(nativeBridge){
       window.NfcBridge.startWriteMode(JSON.stringify(card));
       window.__nfcWD=(r)=>{setWriteStep("done");showToast("Written: "+r.written+" blocks");window.__nfcWD=null};
       window.__nfcWE=(msg)=>{setWriteStep("confirm");showToast("Write error: "+msg,"err");window.__nfcWE=null};
-    } else {
+    }else{
       setTimeout(()=>setWriteStep("done"),2800);
     }
   };
 
-  // Which cards can be written
   const writableCards=savedCards.filter(c=>c.cardType==="mifare_classic"||c.cardType==="mifare_ultralight");
+  const libTypes=["all",...Array.from(new Set(savedCards.map(c=>c.cardType||"generic")))];
+  const q=query.trim().toLowerCase();
+  const filteredCards=savedCards.filter(c=>{
+    if(filterType!=="all"&&(c.cardType||"generic")!==filterType)return false;
+    if(!q)return true;
+    return[c.name,c.serial,c.tagType,c.manufacturer].some(x=>x&&String(x).toLowerCase().includes(q));
+  });
 
-  return(<div style={{minHeight:"100vh",background:"#060c12"}}>
+  return(<div style={{minHeight:"100vh",background:"#060c12",paddingBottom:60}}>
     {/* Header */}
     <div style={{borderBottom:"1px solid #0e1e28",padding:"14px 16px",display:"flex",alignItems:"center",gap:10,position:"sticky",top:0,zIndex:10,background:"#060c12ee",backdropFilter:"blur(12px)"}}>
       <div style={{width:34,height:34,borderRadius:10,background:"#00f5d415",border:"1px solid #00f5d440",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📡</div>
       <div>
         <div style={{fontSize:14,fontWeight:600,color:"#e0f0f4"}}>NFC Vault</div>
-        <div style={{fontSize:9,color:nativeNfc?"#00f5d4":"#3a5060",...mono}}>{nativeNfc?"● Native NFC Ready":"◌ Demo Mode"}</div>
+        <div style={{fontSize:9,color:nfcStatus==="ready"?"#00f5d4":nfcStatus==="disabled"?"#ff4444":"#3a5060",...mono}}>
+          {nfcStatus==="ready"?"● NFC Ready":nfcStatus==="disabled"?"● NFC Disabled — enable in Settings":"◌ Demo Mode"}
+        </div>
       </div>
       <div style={{marginLeft:"auto",fontSize:11,color:"#2a4050",...mono}}>{savedCards.length} saved</div>
     </div>
 
+    {/* NFC Disabled Warning */}
+    {nfcStatus==="disabled"&&<div style={{margin:"8px 14px 0",background:"#2a0808",border:"1px solid #ff444440",borderRadius:10,padding:"10px 14px",fontSize:11,color:"#ff8888",...mono,lineHeight:1.7}}>
+      ⚠ NFC is turned off. Go to Settings → Connections → NFC to enable it.
+    </div>}
+
     {/* Tabs */}
     <div style={{display:"flex",borderBottom:"1px solid #0e1e28",background:"#060c12ee",backdropFilter:"blur(12px)",position:"sticky",top:54,zIndex:9}}>
-      {[["scan","📡 Scan"],["library","🗂 Library"],["write","✍️ Write"]].map(([id,label])=>(
-        <button key={id} onClick={()=>setTab(id)} style={{flex:1,padding:"11px 0",background:"none",color:tab===id?"#00f5d4":"#3a5060",borderBottom:"2px solid "+(tab===id?"#00f5d4":"transparent"),fontSize:12,fontWeight:tab===id?600:400,letterSpacing:.3}}>{label}</button>
+      {[["scan","📡 Scan"],["library","🗂 Library ("+savedCards.length+")"],["write","✍️ Write"]].map(([id,label])=>(
+        <button key={id} onClick={()=>setTab(id)} style={{flex:1,padding:"11px 0",background:"none",color:tab===id?"#00f5d4":"#3a5060",borderBottom:"2px solid "+(tab===id?"#00f5d4":"transparent"),fontSize:11,fontWeight:tab===id?600:400,letterSpacing:.3}}>{label}</button>
       ))}
     </div>
 
@@ -449,37 +850,66 @@ function App(){
           <div style={{textAlign:"center",paddingTop:32}}>
             <div style={{width:110,height:110,margin:"0 auto 20px",background:"radial-gradient(circle,#00f5d412,transparent)",border:"1px solid #00f5d430",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:38}}>📡</div>
             <div style={{fontSize:17,fontWeight:600,color:"#c8e4e8",marginBottom:8}}>Ready to Scan</div>
-            <div style={{fontSize:12,color:"#3a5060",marginBottom:28,lineHeight:1.8}}>
+            <div style={{fontSize:12,color:"#3a5060",marginBottom:20,lineHeight:1.8}}>
               MIFARE Classic · NTAG · NDEF<br/>ISO-DEP · FeliCa · NFC-V · ISO 14443
             </div>
-            <button onClick={startScan} style={{background:"linear-gradient(135deg,#00f5d4,#00c4a8)",color:"#060c12",borderRadius:12,padding:"13px 36px",fontSize:14,fontWeight:700,boxShadow:"0 0 24px #00f5d440",letterSpacing:.3}}>Hold Card &amp; Scan</button>
-            {!nativeNfc&&<div style={{marginTop:18,background:"#1a1000",border:"1px solid #ffb80030",borderRadius:10,padding:"10px 14px",fontSize:10,color:"#ffb80080",...mono,lineHeight:1.7}}>⚠ Demo mode — install APK for real NFC</div>}
+            {nativeBridge?
+              <div style={{fontSize:12,color:"#4a6070",marginBottom:28,...mono,lineHeight:1.8}}>
+                Tap a card on the back of your phone<br/>or press the button below
+              </div>
+            :null}
+            <button onClick={startScan} style={{background:"linear-gradient(135deg,#00f5d4,#00c4a8)",color:"#060c12",borderRadius:12,padding:"13px 36px",fontSize:14,fontWeight:700,boxShadow:"0 0 24px #00f5d440",letterSpacing:.3}}>
+              {nativeBridge?"Scan NFC Card":"Demo Scan"}
+            </button>
+            {!nativeBridge&&<div style={{marginTop:18,background:"#1a1000",border:"1px solid #ffb80030",borderRadius:10,padding:"10px 14px",fontSize:10,color:"#ffb80080",...mono,lineHeight:1.7}}>⚠ Demo mode — install APK for real NFC</div>}
           </div>
         )}
         {scanning&&<div style={{textAlign:"center",paddingTop:40}}>
           <ScanRings/>
           <div style={{marginTop:24,fontSize:13,color:"#00f5d4",...mono}}>Scanning…</div>
           <div style={{fontSize:11,color:"#3a5060",marginTop:6}}>Hold card near back of device</div>
+          <button onClick={()=>setScanning(false)} style={{marginTop:20,...btnS("#3a5060"),padding:"8px 20px"}}>Cancel</button>
         </div>}
         {!scanning&&scannedCard&&<div style={{animation:"fadeSlide .3s ease"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
             <div style={{fontSize:12,color:"#00f5d4",...mono}}>✓ Card detected</div>
             <button onClick={()=>setScanned(null)} style={btnS("#3a5060",true)}>✕ Clear</button>
           </div>
-          <DetailPanel card={scannedCard} onSave={saveCard} onWrite={goToWrite} onRename={(name)=>renameCard(scannedCard,name)}/>
+          <DetailPanel card={scannedCard} onSave={saveCard} onWrite={goToWrite} onRename={(name)=>renameCard(scannedCard,name)} onExport={exportCard} onEmulate={emulateCard} isEmulating={isEmulating}/>
           <button onClick={startScan} style={{width:"100%",marginTop:10,background:"none",border:"1px solid #1a2830",borderRadius:10,padding:"10px",color:"#3a5060",fontSize:12}}>Scan another</button>
         </div>}
       </div>}
 
       {/* ── LIBRARY TAB ── */}
       {tab==="library"&&<div style={{animation:"fadeSlide .3s ease"}}>
+        <input ref={importRef} type="file" accept="application/json,.json" onChange={importCards} style={{display:"none"}}/>
+        {/* Toolbar */}
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <button onClick={()=>importRef.current&&importRef.current.click()} style={{...btnS("#00f5d4",true),flex:1,padding:"8px",textAlign:"center"}}>📥 Import</button>
+          <button onClick={exportAll} style={{...btnS("#7B61FF",true),flex:1,padding:"8px",textAlign:"center"}}>📤 Export All</button>
+        </div>
         {savedCards.length===0?
-          <div style={{textAlign:"center",paddingTop:60,color:"#2a4050"}}>
+          <div style={{textAlign:"center",paddingTop:50,color:"#2a4050"}}>
             <div style={{fontSize:34,marginBottom:12}}>🗂</div>
-            <div style={{fontSize:12}}>No saved cards yet</div>
+            <div style={{fontSize:12,marginBottom:6}}>No saved cards yet</div>
+            <div style={{fontSize:11,color:"#1a3040"}}>Scan a card and tap Save, or Import a JSON backup</div>
           </div>
         :<>
-          {savedCards.map(c=>(
+          {/* Search + filter */}
+          <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search name, serial, type…" style={{width:"100%",background:"#0a1820",border:"1px solid #1a2830",borderRadius:10,color:"#c8d8e0",padding:"9px 12px",...mono,fontSize:12,outline:"none",marginBottom:10}}/>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
+            {libTypes.map(t=>{
+              const m=t==="all"?{label:"All",color:"#7a90a0"}:(CARD_TYPES[t]||CARD_TYPES.generic);
+              const on=filterType===t;
+              return(<button key={t} onClick={()=>setFilterType(t)} style={{background:on?m.color+"20":"#0c1820",border:"1px solid "+(on?m.color:"#1a2830"),borderRadius:6,padding:"3px 10px",fontSize:10,color:on?m.color:"#5a7888",...mono}}>{t==="all"?"All":m.label}</button>);
+            })}
+          </div>
+          <div style={{fontSize:10,color:"#4a6070",...mono,marginBottom:10,letterSpacing:1}}>
+            {filteredCards.length===savedCards.length?("SAVED CARDS ("+savedCards.length+")"):(filteredCards.length+" OF "+savedCards.length+" CARDS")}
+          </div>
+          {filteredCards.length===0?
+            <div style={{textAlign:"center",padding:"30px 0",color:"#2a4050",fontSize:11,...mono}}>No cards match your search</div>
+          :filteredCards.map(c=>(
             <CardChip key={c.id} card={c} selected={selected?.id===c.id} onClick={()=>setSelected(s=>s?.id===c.id?null:c)}/>
           ))}
           {selected&&<div style={{borderTop:"1px solid #0e1e28",paddingTop:14,animation:"fadeSlide .25s ease"}}>
@@ -487,13 +917,23 @@ function App(){
               <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1}}>DETAIL</div>
               <button onClick={()=>deleteCard(selected.id)} style={btnS("#ff4444",true)}>🗑 Delete</button>
             </div>
-            <DetailPanel card={selected} onSave={saveCard} onWrite={goToWrite} onRename={(name)=>renameCard(selected,name)}/>
+            <DetailPanel card={selected} onSave={saveCard} onWrite={goToWrite} onRename={(name)=>renameCard(selected,name)} onExport={exportCard} onEmulate={emulateCard} isEmulating={isEmulating}/>
           </div>}
         </>}
       </div>}
 
-      {/* ── WRITE TAB ── */}
+      {/* ── WRITE TAB (Compose NDEF / Clone dump) ── */}
       {tab==="write"&&<div style={{animation:"fadeSlide .3s ease"}}>
+        {/* Sub-mode toggle */}
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {[["compose","🔗 Write Data"],["clone","🧬 Clone Card"]].map(([id,label])=>(
+            <button key={id} onClick={()=>{setWriteSub(id);resetCompose();}} style={{flex:1,padding:"9px 0",borderRadius:10,background:writeSub===id?"#00BFFF18":"#0c1820",border:"1px solid "+(writeSub===id?"#00BFFF":"#1a2830"),color:writeSub===id?"#00BFFF":"#5a7888",fontSize:12,fontWeight:600,...mono}}>{label}</button>
+          ))}
+        </div>
+
+        {writeSub==="compose"&&<NdefComposer step={composeStep} writeResult={writeResult} onWrite={writeNdefToTag} onReset={resetCompose}/>}
+
+        {writeSub==="clone"&&<>
         {writeStep==="select"&&<>
           <div style={{fontSize:10,color:"#4a6070",...mono,letterSpacing:1,marginBottom:10}}>SELECT CARD TO CLONE</div>
           {writableCards.length===0?
@@ -504,33 +944,34 @@ function App(){
           :writableCards.map(c=>(
             <CardChip key={c.id} card={c} selected={writeTarget?.id===c.id} onClick={()=>setWriteTarget(s=>s?.id===c.id?null:c)}/>
           ))}
-          {writeTarget&&<button onClick={()=>setWriteStep("confirm")} style={{width:"100%",marginTop:14,background:"linear-gradient(135deg,#ffb800,#e09000)",color:"#060c12",borderRadius:12,padding:"13px",fontSize:13,fontWeight:700,boxShadow:"0 0 20px #ffb80040"}}>✍️ Write "{writeTarget.name}"</button>}
+          {writeTarget&&<button onClick={()=>setWriteStep("confirm")} style={{width:"100%",marginTop:14,background:"linear-gradient(135deg,#ffb800,#e09000)",color:"#060c12",borderRadius:12,padding:"13px",fontSize:13,fontWeight:700,boxShadow:"0 0 20px #ffb80040"}}>✍️ Clone "{writeTarget.name}"</button>}
         </>}
 
         {writeStep==="confirm"&&writeTarget&&<div>
           <div style={{background:"#1a1000",border:"1px solid #ffb80040",borderRadius:12,padding:"14px",marginBottom:14}}>
-            <div style={{fontSize:12,color:"#ffb800",...mono,marginBottom:6}}>⚠ Confirm Write</div>
-            <div style={{fontSize:11,color:"#906030",lineHeight:1.7}}>Overwrites ALL data on target card with <strong style={{color:"#ffb800"}}>{writeTarget.name}</strong>. Cannot be undone.</div>
+            <div style={{fontSize:12,color:"#ffb800",...mono,marginBottom:6}}>⚠ Confirm Clone</div>
+            <div style={{fontSize:11,color:"#906030",lineHeight:1.7}}>This will write the data from <strong style={{color:"#ffb800"}}>{writeTarget.name}</strong> onto a blank card. Hold the target card near the phone when ready.</div>
           </div>
           <CardChip card={writeTarget} selected/>
           <div style={{display:"flex",gap:8,marginTop:12}}>
             <button onClick={()=>setWriteStep("select")} style={{...btnS("#3a5060"),flex:1,padding:"11px"}}>← Back</button>
-            <button onClick={()=>doWrite(writeTarget)} style={{flex:2,padding:"11px",background:"linear-gradient(135deg,#ffb800,#e09000)",color:"#060c12",borderRadius:10,fontSize:13,fontWeight:700}}>✍️ Start Writing</button>
+            <button onClick={()=>doWrite(writeTarget)} style={{flex:2,padding:"11px",background:"linear-gradient(135deg,#ffb800,#e09000)",color:"#060c12",borderRadius:10,fontSize:13,fontWeight:700}}>✍️ Start Cloning</button>
           </div>
         </div>}
 
         {writeStep==="writing"&&<div style={{textAlign:"center",paddingTop:40}}>
           <div style={{width:70,height:70,margin:"0 auto 18px",border:"3px solid #ffb80060",borderTopColor:"#ffb800",borderRadius:"50%",animation:"spin .8s linear infinite"}}/>
           <div style={{fontSize:13,color:"#ffb800",...mono}}>Writing…</div>
-          <div style={{fontSize:11,color:"#3a5060",marginTop:6}}>Keep card near device</div>
+          <div style={{fontSize:11,color:"#3a5060",marginTop:6}}>Hold target card near device</div>
         </div>}
 
         {writeStep==="done"&&<div style={{textAlign:"center",paddingTop:40,animation:"fadeSlide .3s ease"}}>
           <div style={{width:72,height:72,margin:"0 auto 18px",background:"radial-gradient(circle,#00f5d420,transparent)",border:"2px solid #00f5d4",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28}}>✓</div>
-          <div style={{fontSize:16,fontWeight:600,color:"#00f5d4",marginBottom:6}}>Write Complete!</div>
-          <div style={{fontSize:11,color:"#3a5060",marginBottom:24}}>Card cloned successfully</div>
+          <div style={{fontSize:16,fontWeight:600,color:"#00f5d4",marginBottom:6}}>Clone Complete!</div>
+          <div style={{fontSize:11,color:"#3a5060",marginBottom:24}}>Card data written successfully</div>
           <button onClick={()=>{setWriteStep("select");setWriteTarget(null)}} style={{...btnS("#00f5d4"),padding:"11px 28px"}}>Done</button>
         </div>}
+        </>}
       </div>}
 
     </div>
