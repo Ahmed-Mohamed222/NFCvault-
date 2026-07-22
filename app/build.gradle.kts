@@ -8,10 +8,10 @@ android {
 
     defaultConfig {
         applicationId = "com.nfcvault"
-        minSdk = 21
+        minSdk = 23
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 5
+        versionName = "3.1.1"
     }
 
     buildTypes {
@@ -27,4 +27,6 @@ android {
     }
 }
 
-dependencies {}
+dependencies {
+    testImplementation(libs.junit)
+}

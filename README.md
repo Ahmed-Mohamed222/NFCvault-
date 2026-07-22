@@ -1,50 +1,71 @@
-# 📱 NFC Vault
+# NFC Vault
 
-NFC Vault is a native Android application that operates on a hybrid architecture, acting as a bridge between the Android device's physical NFC transceiver and a web-based user interface. It is designed as a "Universal Reader" capable of detecting, connecting to, and extracting data from a wide variety of NFC tag types, while providing specialized write capabilities for MIFARE Classic cards.
+NFC Vault is an offline Android application for inspecting compatible NFC cards and tags, organizing permitted data in an encrypted local vault, writing standard NDEF records, and sharing standard NDEF messages through Android Host Card Emulation (HCE).
 
-## ⚙️ Core Architecture
+## What it supports
 
-* **Hybrid Frontend-Backend Bridge:** * **UI Layer:** Rendered using an Android `WebView` loading a local HTML interface.
-  * **JavaScript Interface:** A custom `NfcBridge` allows the web frontend to trigger native Java methods for NFC operations.
-  * **Asynchronous Processing:** All NFC I/O operations are offloaded to background daemon threads to prevent UI freezing.
-* **NFC Dispatch System:** Uses Android's **Foreground Dispatch** to intercept NFC tags natively while the app is active on the screen.
+- Android NFC technologies: NFC-A, NFC-B, NFC-F/FeliCa, NFC-V/ISO 15693, ISO-DEP, NDEF, NDEF-formatable, MIFARE Classic, MIFARE Ultralight/NTAG, and NFC Barcode.
+- User categories: access, transit, payment, hotel key, identity, loyalty, tickets, health, mobility, smart home, NFC tag, product/asset, and other.
+- NDEF creation: websites, text, telephone actions, email actions, map locations, and vCards.
+- Saved-card copying: choose a saved source from the vault, scan a compatible writable destination, and copy its standards-compliant public NDEF message with read-back verification where Android supports it.
+- NDEF sharing: eligible non-secure NDEF content can be presented as an NFC Forum Type 4 Tag on devices with HCE.
+- Encrypted local storage using AES-GCM and an Android Keystore-held key.
+- JSON import/export using Android's system document picker.
+- Larger-text, high-contrast, reduced-motion, screen-reader, and keyboard-focus support.
 
-## 📡 Supported NFC Technologies
+## Important compatibility limits
 
-The application implements auto-detection and specific read logic for:
-1. **MIFARE Classic (1K/4K):** Comprehensive sector/block reading using a predefined cryptographic key dictionary.
-2. **MIFARE Ultralight / NTAG:** Reads raw pages and auto-identifies capacities (e.g., NTAG 213/215/216) via the Capability Container.
-3. **NDEF:** Fully parses records, decoding URIs, Text, and MIME types.
-4. **ISO-DEP (Smart Cards):** Extracts Historical Bytes and Higher Layer Responses.
-5. **NFC-V (ISO 15693):** Connects and reads single blocks.
-6. **NFC-F (FeliCa):** Extracts IDm, PMm, and System Codes.
-7. **NFC-A & NFC-B (Generic):** Extracts standard ATQA, SAK, and Protocol Information.
+Scanning a card does not mean it can be copied or emulated. Payment cards, access badges, transit passes, hotel keys, government or employee IDs, and many other credentials use issuer-controlled cryptography or secure hardware. NFC Vault can identify their public technology information but does not copy protected credentials, extract secret keys, or emulate payment cards. Use the issuer's official app or wallet enrollment when digital use is supported.
 
-## 🔑 Key Features
+Phones also cannot read low-frequency RFID, UHF RFID, Bluetooth-only, or UWB-only credentials through the Android NFC API.
 
-### MIFARE Classic Authentication
-The app includes a hardcoded dictionary (`KEY_DICT`) of 10 cryptographic keys (including Default, MAD, NFC Forum, and specific manufacturer keys). It iterates through sectors attempting to authenticate with Key A and Key B to extract protected hex data.
+## Privacy and security
 
-### Card Writing Operations
-Writing is currently exclusively supported for **MIFARE Classic** tags. The write method accepts a JSON payload and systematically writes hex data to blocks. 
-* *Safety Feature:* The write method explicitly skips `isTrailer` blocks to prevent accidental overwriting of sector access conditions and permanent card locking.
+- The application does not request internet permission.
+- Cleartext networking and WebView cross-origin file access are disabled.
+- Saved data is encrypted before being written to app preferences.
+- Android cloud backup and device-transfer backup are disabled for all app data.
+- HCE requires the device to be unlocked and is limited to standard NDEF content.
+- Only public NFC Forum/default MIFARE keys are tried; issuer-specific keys are not included.
 
-## 💻 JavaScript API Reference
+## Build
 
-The frontend interacts with the native Android code through the following injected methods (`window.NfcBridge`):
+Requirements:
 
-| Method | Description |
-| :--- | :--- |
-| `isNfcAvailable()` | Returns `true` if the device has an NFC chip. |
-| `isNfcEnabled()` | Returns `true` if NFC is turned on in settings. |
-| `startReadMode()` | Sets the app to read the next tapped tag. |
-| `startWriteMode(json)` | Primes the app to write the provided JSON configuration to the next tapped MIFARE Classic tag. |
+- JDK 11 or newer
+- Android SDK Platform 34 and Build Tools 34.0.0
 
-Callbacks invoked in JavaScript (`window.NfcCallbacks`):
+On Windows:
 
-| Callback | Trigger Condition |
-| :--- | :--- |
-| `onCardRead(json)` | Fired successfully after ANY tag is read and parsed. |
-| `onReadError(error)` | Fired if a tag is dropped during read or IO exceptions occur. |
-| `onWriteComplete(json)`| Fired after a write operation, returning success/fail metrics. |
-| `onWriteError(error)` | Fired if the tag isn't MIFARE Classic, or if a write fails. |
+```powershell
+.\gradlew.bat testDebugUnitTest lintDebug assembleDebug
+```
+
+The installable development APK is generated at:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+### Copy a saved card or tag
+
+1. Scan a source containing standard NDEF content and save it securely.
+2. Open **Create**, select **Copy saved card**, and choose the saved source.
+3. Choose **Scan destination and copy**, then hold a compatible writable NFC card or tag near the phone.
+4. NFC Vault checks write support and capacity, writes the public NDEF message, and reads it back for comparison on normal NDEF destinations.
+
+This workflow copies standard public NDEF records—not protected access credentials, payment applications, transit balances, hotel keys, identity secrets, or issuer cryptographic data.
+
+Production releases require a private signing configuration supplied by the application owner. The normal `assembleRelease` task creates an unsigned release artifact when no production key is configured.
+
+## Architecture
+
+- `NfcVaultActivity`: NFC dispatch, card inspection, safe NDEF writing, file picker integration, and the restricted JavaScript bridge.
+- `SecureVaultStore`: AES-GCM encryption backed by Android Keystore.
+- `CardEmulationService`: crash-safe NFC Forum Type 4 NDEF HCE service.
+- `NfcDataUtils`: validated hex decoding and safe JSON filenames.
+- `assets/www/index.html`: self-contained responsive React interface; no network-loaded resources.
+
+## Testing notes
+
+Automated checks cover utility validation, Java compilation, Android resources/manifests, lint, and APK packaging. NFC behavior must also be tested on physical Android devices because NFC chipsets, antenna placement, tag support, and vendor firmware differ.
