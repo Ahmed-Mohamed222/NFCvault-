@@ -1,0 +1,20 @@
+name: Web assets
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-precompiled-asset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm run build:web
+      # Fails when web-src/app.jsx was edited without running `npm run build:web`.
+      - run: git diff --exit-code -- app/src/main/assets/www/app.js
