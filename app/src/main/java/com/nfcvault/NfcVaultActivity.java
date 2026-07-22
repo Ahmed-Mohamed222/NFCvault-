@@ -88,7 +88,7 @@ public class NfcVaultActivity extends Activity {
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
         ws.setDatabaseEnabled(false);
-        ws.setAllowFileAccess(true);
+        ws.setAllowFileAccess(false); // file:///android_asset stays reachable; the filesystem does not
         ws.setAllowContentAccess(false);
         ws.setAllowFileAccessFromFileURLs(false);
         ws.setAllowUniversalAccessFromFileURLs(false);
@@ -491,9 +491,27 @@ public class NfcVaultActivity extends Activity {
                 // GET_VERSION not supported — fall back to CC detection
             }
 
+            // Read and validate the NFC Forum capability container (page 3). Its size byte
+            // provides a safe bound when GET_VERSION cannot identify the exact variant.
+            int capabilityDataSize = 0;
+            try {
+                byte[] header = mfu.readPages(0);
+                if (header != null && header.length >= 16 && (header[12] & 0xFF) == 0xE1) {
+                    capabilityDataSize = (header[14] & 0xFF) * 8;
+                    String currentType = card.optString("tagType", "");
+                    if (currentType.equals("NTAG / Ultralight")
+                            || currentType.equals("NTAG (unknown variant)")) {
+                        if (capabilityDataSize == 144) card.put("tagType", "NTAG 213");
+                        else if (capabilityDataSize == 504) card.put("tagType", "NTAG 215");
+                        else if (capabilityDataSize == 888) card.put("tagType", "NTAG 216");
+                    }
+                }
+            } catch (Exception ignored) {}
+
             // Read pages
             JSONArray pagesArr = new JSONArray();
-            int maxPages = 135; // NTAG I2C 2K max; will stop on IOException
+            int maxPages = NfcDataUtils.ultralightPageCount(
+                    card.optString("tagType", null), capabilityDataSize);
             for (int p = 0; p < maxPages; p += 4) {
                 try {
                     byte[] data = mfu.readPages(p);
@@ -511,19 +529,6 @@ public class NfcVaultActivity extends Activity {
             }
             card.put("pages", pagesArr);
             card.put("totalPages", pagesArr.length());
-
-            // Detect NTAG type from capability container (page 3) as fallback
-            if (!card.has("chipVendor") && pagesArr.length() > 3) {
-                try {
-                    String p3 = pagesArr.getJSONObject(3).getString("data").replaceAll(" ", "");
-                    if (p3.length() >= 6) {
-                        int ccSize = Integer.parseInt(p3.substring(4, 6), 16) * 8;
-                        if (ccSize <= 144) card.put("tagType", "NTAG 213");
-                        else if (ccSize <= 504) card.put("tagType", "NTAG 215");
-                        else card.put("tagType", "NTAG 216");
-                    }
-                } catch (Exception ignored) {}
-            }
 
             // Also try to read NDEF from this tag
             Ndef ndefTech = Ndef.get(tag);
@@ -1260,7 +1265,10 @@ public class NfcVaultActivity extends Activity {
         if (payload.length < 1) return "";
         int langLen = payload[0] & 0x3F;
         if (payload.length < 1 + langLen) return "";
-        return new String(payload, 1 + langLen, payload.length - 1 - langLen, Charset.forName("UTF-8"));
+        // Bit 7 of the status byte selects UTF-16 instead of UTF-8.
+        Charset charset = (payload[0] & 0x80) != 0
+                ? StandardCharsets.UTF_16 : StandardCharsets.UTF_8;
+        return new String(payload, 1 + langLen, payload.length - 1 - langLen, charset);
     }
 
     // ========================================================================
@@ -1531,13 +1539,11 @@ public class NfcVaultActivity extends Activity {
     // ========================================================================
     private void notifyJS(String cb, String data) {
         if (webView == null || !webViewReady) return;
-        String safe = data
-            .replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r");
+        // JSONObject.quote escapes quotes, backslashes, control chars and U+2028/U+2029,
+        // so tag content can never terminate the literal and inject script.
+        String literal = JSONObject.quote(data);
         runOnUiThread(() -> webView.evaluateJavascript(
-            "window.NfcCallbacks&&window.NfcCallbacks." + cb + "('" + safe + "')", null));
+            "window.NfcCallbacks&&window.NfcCallbacks." + cb + "(" + literal + ")", null));
     }
 
     private void openExternalUri(Uri uri) {

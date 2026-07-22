@@ -22,6 +22,38 @@ final class NfcDataUtils {
         return output;
     }
 
+    /**
+     * Total readable pages for an Ultralight/NTAG variant. Reads past the last page can
+     * wrap around to page 0 instead of failing, so the page loop needs a real upper bound.
+     */
+    static int ultralightPageCount(String tagType) {
+        return ultralightPageCount(tagType, 0);
+    }
+
+    static int ultralightPageCount(String tagType, int capabilityDataSizeBytes) {
+        String name = tagType == null ? "" : tagType;
+        if (name.startsWith("NTAG 210")) return 20;
+        if (name.startsWith("NTAG 212")) return 41;
+        if (name.startsWith("NTAG 213")) return 45;
+        if (name.startsWith("NTAG 215")) return 135;
+        if (name.startsWith("NTAG 216")) return 231;
+        if (name.startsWith("MIFARE Ultralight C")) return 48;
+        if (name.startsWith("MIFARE Ultralight EV1 (48")) return 20;
+        if (name.startsWith("MIFARE Ultralight EV1 (128")) return 41;
+        if (name.equals("MIFARE Ultralight")) return 16;
+
+        // The NFC Forum capability container describes the NDEF data area. Use it only
+        // when the platform and GET_VERSION did not identify an exact chip variant.
+        switch (capabilityDataSizeBytes) {
+            case 48:  return 20;
+            case 128: return 41;
+            case 144: return 45;
+            case 504: return 135;
+            case 888: return 231;
+            default:  return 16; // Smallest safe layout; never guess past the physical end.
+        }
+    }
+
     static String sanitizeJsonFileName(String name) {
         String safe = name == null || name.trim().isEmpty()
                 ? "nfc-vault-export.json" : name.trim();

@@ -114,11 +114,6 @@ public class CardEmulationService extends HostApduService {
         }
     }
 
-    public static void setRawNdefMessage(byte[] ndef) {
-        ndefMessage = ndef == null || ndef.length > MAX_NDEF_SIZE
-                ? new byte[0] : Arrays.copyOf(ndef, ndef.length);
-    }
-
     @Override
     public byte[] processCommandApdu(byte[] commandApdu, Bundle extras) {
         if (commandApdu == null || commandApdu.length < 4) return WRONG_LENGTH_SW;
