@@ -1363,6 +1363,7 @@ public class NfcVaultActivity extends Activity {
                     result.put("written", msg.getRecords().length);
                     result.put("bytes", bytes.length);
                     result.put("tag", "NDEF (formatted)");
+                    result.put("verified", false);
                     notifyJS("onWriteComplete", result.toString());
                     return;
                 } finally {

@@ -16,9 +16,9 @@ Use **Rename** or the category selector to improve organization. Import and expo
 
 ## Creating an NFC tag
 
-Open **Create**, select a record type, and enter its content. NFC Vault can create links, text notes, phone and email actions, map locations, and vCards. Choose **Continue to phone scan**, then hold a compatible writable NDEF tag near the phone.
+Open **Create**, select a record type, and enter its content. NFC Vault can create links, text notes, phone and email actions, map locations, and vCards. Choose **Scan destination tag**, then hold a compatible writable NDEF tag near the phone.
 
-For an existing saved item with a standard NDEF message, choose **Copy NDEF**. This copies the public NDEF content only; it does not clone secure access, payment, hotel, identity, or transit credentials.
+For an existing saved item with a standard NDEF message, open **Create**, select **Copy saved card**, choose the source, and then select **Scan destination and copy**. Hold the writable destination near the phone until the result is displayed. This copies the public NDEF content only; it does not clone secure access, payment, hotel, identity, or transit credentials.
 
 Normal NDEF writes are read back and compared before success is reported. Blank NDEF-formatable tags are formatted when Android supports them.
 

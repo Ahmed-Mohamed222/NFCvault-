@@ -7,7 +7,7 @@ NFC Vault is an offline Android application for inspecting compatible NFC cards 
 - Android NFC technologies: NFC-A, NFC-B, NFC-F/FeliCa, NFC-V/ISO 15693, ISO-DEP, NDEF, NDEF-formatable, MIFARE Classic, MIFARE Ultralight/NTAG, and NFC Barcode.
 - User categories: access, transit, payment, hotel key, identity, loyalty, tickets, health, mobility, smart home, NFC tag, product/asset, and other.
 - NDEF creation: websites, text, telephone actions, email actions, map locations, and vCards.
-- NDEF copying: standards-compliant NDEF messages can be copied to compatible writable tags.
+- Saved-card copying: choose a saved source from the vault, scan a compatible writable destination, and copy its standards-compliant public NDEF message with read-back verification where Android supports it.
 - NDEF sharing: eligible non-secure NDEF content can be presented as an NFC Forum Type 4 Tag on devices with HCE.
 - Encrypted local storage using AES-GCM and an Android Keystore-held key.
 - JSON import/export using Android's system document picker.
@@ -46,6 +46,15 @@ The installable development APK is generated at:
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 ```
+
+### Copy a saved card or tag
+
+1. Scan a source containing standard NDEF content and save it securely.
+2. Open **Create**, select **Copy saved card**, and choose the saved source.
+3. Choose **Scan destination and copy**, then hold a compatible writable NFC card or tag near the phone.
+4. NFC Vault checks write support and capacity, writes the public NDEF message, and reads it back for comparison on normal NDEF destinations.
+
+This workflow copies standard public NDEF records—not protected access credentials, payment applications, transit balances, hotel keys, identity secrets, or issuer cryptographic data.
 
 Production releases require a private signing configuration supplied by the application owner. The normal `assembleRelease` task creates an unsigned release artifact when no production key is configured.
 
