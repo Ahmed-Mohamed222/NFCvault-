@@ -2,12 +2,14 @@ package com.nfcvault;
 
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.annotation.SuppressLint;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.nfc.FormatException;
 import android.nfc.NdefMessage;
 import android.nfc.NdefRecord;
@@ -25,8 +27,12 @@ import android.nfc.tech.NfcF;
 import android.nfc.tech.NfcV;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -35,28 +41,24 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class NfcVaultActivity extends Activity {
 
     private static final String TAG = "NfcVault";
-    private static final String PREFS_NAME = "nfc_vault_prefs";
+    private static final int REQUEST_OPEN_FILE = 7001;
+    private static final int REQUEST_EXPORT_JSON = 7002;
 
-    // Extended MIFARE Classic key dictionary
+    // Public NFC Forum/default keys only. NFC Vault does not probe issuer-specific keys.
     private static final byte[][] KEY_DICT = {
         MifareClassic.KEY_DEFAULT,                            // FF FF FF FF FF FF
         MifareClassic.KEY_MIFARE_APPLICATION_DIRECTORY,       // A0 A1 A2 A3 A4 A5
-        MifareClassic.KEY_NFC_FORUM,                          // D3 F7 D3 F7 D3 F7
-        hexToBytes("000000000000"),
-        hexToBytes("A0B0C0D0E0F0"),
-        hexToBytes("AABBCCDDEEFF"),
-        hexToBytes("4D3A99C351DD"),
-        hexToBytes("1A982C7E459A"),
-        hexToBytes("714C5C886E97"),
-        hexToBytes("587EE5F9350F"),
-        hexToBytes("107B4B303784"),                           // Miwa Lock
-        hexToBytes("414C41524F4E"),                           // ALARON
+        MifareClassic.KEY_NFC_FORUM                           // D3 F7 D3 F7 D3 F7
     };
 
     private NfcAdapter nfcAdapter;
@@ -64,32 +66,77 @@ public class NfcVaultActivity extends Activity {
     private PendingIntent pendingIntent;
     private IntentFilter[] intentFilters;
     private String[][] techLists;
-    private volatile boolean writeMode = false;
-    private volatile String pendingWriteJson = null;
     private volatile boolean ndefWriteMode = false;
     private volatile byte[] pendingNdefBytes = null;
     private boolean webViewReady = false;
+    private final AtomicBoolean operationInProgress = new AtomicBoolean(false);
+    private SecureVaultStore secureVaultStore;
+    private ValueCallback<Uri[]> fileChooserCallback;
+    private String pendingExportJson;
 
     @Override
+    @SuppressLint("SetJavaScriptEnabled")
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
+        secureVaultStore = new SecureVaultStore(this);
 
         webView = findViewById(R.id.webView);
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
-        ws.setDatabaseEnabled(true);
-        ws.setAllowFileAccessFromFileURLs(true);
-        ws.setAllowUniversalAccessFromFileURLs(true);
+        ws.setDatabaseEnabled(false);
+        ws.setAllowFileAccess(true);
+        ws.setAllowContentAccess(false);
+        ws.setAllowFileAccessFromFileURLs(false);
+        ws.setAllowUniversalAccessFromFileURLs(false);
+        ws.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        ws.setSupportMultipleWindows(false);
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 webViewReady = true;
                 handleIntent(getIntent());
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+                if ("file".equalsIgnoreCase(uri.getScheme())) return false;
+                openExternalUri(uri);
+                return true;
+            }
+
+            @SuppressWarnings("deprecation")
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                Uri uri = Uri.parse(url);
+                if ("file".equalsIgnoreCase(uri.getScheme())) return false;
+                openExternalUri(uri);
+                return true;
+            }
+        });
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(
+                    WebView view,
+                    ValueCallback<Uri[]> callback,
+                    FileChooserParams params) {
+                if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
+                fileChooserCallback = callback;
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/json");
+                try {
+                    startActivityForResult(intent, REQUEST_OPEN_FILE);
+                    return true;
+                } catch (Exception e) {
+                    fileChooserCallback = null;
+                    return false;
+                }
             }
         });
         webView.addJavascriptInterface(new NfcBridge(), "NfcBridge");
@@ -118,10 +165,67 @@ public class NfcVaultActivity extends Activity {
     }
 
     @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_OPEN_FILE) {
+            if (fileChooserCallback != null) {
+                Uri[] result = null;
+                if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                    result = new Uri[]{data.getData()};
+                }
+                fileChooserCallback.onReceiveValue(result);
+                fileChooserCallback = null;
+            }
+            return;
+        }
+        if (requestCode == REQUEST_EXPORT_JSON) {
+            boolean success = false;
+            String message = "Export cancelled";
+            if (resultCode == RESULT_OK && data != null && data.getData() != null
+                    && pendingExportJson != null) {
+                try (OutputStream output = getContentResolver().openOutputStream(data.getData())) {
+                    if (output == null) throw new IOException("Unable to open destination");
+                    output.write(pendingExportJson.getBytes(StandardCharsets.UTF_8));
+                    success = true;
+                    message = "Export saved";
+                } catch (Exception e) {
+                    Log.e(TAG, "Export failed", e);
+                    message = "Export failed: " + safeMessage(e);
+                }
+            }
+            pendingExportJson = null;
+            try {
+                JSONObject result = new JSONObject();
+                result.put("success", success);
+                result.put("message", message);
+                notifyJS("onExportComplete", result.toString());
+            } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (fileChooserCallback != null) {
+            fileChooserCallback.onReceiveValue(null);
+            fileChooserCallback = null;
+        }
+        if (webView != null) {
+            webView.removeJavascriptInterface("NfcBridge");
+            webView.destroy();
+        }
+        CardEmulationService.setEmulationData(null);
+        super.onDestroy();
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         if (nfcAdapter != null) {
             nfcAdapter.enableForegroundDispatch(this, pendingIntent, intentFilters, techLists);
+        }
+        if (webViewReady) {
+            notifyJS("onNfcStatus", nfcAdapter == null
+                    ? "unavailable" : (nfcAdapter.isEnabled() ? "ready" : "disabled"));
         }
     }
 
@@ -154,24 +258,29 @@ public class NfcVaultActivity extends Activity {
             tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG);
         }
         if (tag == null) return;
+        if (!operationInProgress.compareAndSet(false, true)) return;
 
         intent.setAction(null);
 
         final Runnable job;
         if (ndefWriteMode && pendingNdefBytes != null) {
             job = () -> writeNdef(tag);
-        } else if (writeMode && pendingWriteJson != null) {
-            job = () -> writeCard(tag);
         } else {
             job = () -> readCard(tag);
         }
-        Thread t = new Thread(job);
+        Thread t = new Thread(() -> {
+            try {
+                job.run();
+            } finally {
+                operationInProgress.set(false);
+            }
+        });
         t.setDaemon(true);
         t.start();
     }
 
     // ========================================================================
-    //  UNIVERSAL CARD READER — auto-detects ALL NFC card types
+    //  SUPPORTED CARD READER — identifies technologies exposed by Android NFC
     // ========================================================================
     private void readCard(Tag tag) {
         try {
@@ -283,7 +392,7 @@ public class NfcVaultActivity extends Activity {
             JSONObject mem = new JSONObject();
             mem.put("total", mfc.getSize());
             mem.put("sectors", mfc.getSectorCount());
-            mem.put("blocksPerSector", 4);
+            mem.put("blocks", mfc.getBlockCount());
             mem.put("bytesPerBlock", 16);
             card.put("memory", mem);
 
@@ -292,21 +401,19 @@ public class NfcVaultActivity extends Activity {
                 JSONObject sector = new JSONObject();
                 sector.put("sector", s);
                 boolean authOk = false;
-                String usedKey = "";
                 for (byte[] key : KEY_DICT) {
                     try {
                         if (mfc.authenticateSectorWithKeyA(s, key)) {
-                            authOk = true; usedKey = bytesToHex(key, " "); break;
+                            authOk = true; break;
                         }
                     } catch (IOException ignored) {}
                     try {
                         if (mfc.authenticateSectorWithKeyB(s, key)) {
-                            authOk = true; usedKey = bytesToHex(key, " "); break;
+                            authOk = true; break;
                         }
                     } catch (IOException ignored) {}
                 }
                 sector.put("accessible", authOk);
-                if (authOk) sector.put("keyUsed", usedKey);
 
                 JSONArray blocks = new JSONArray();
                 int firstBlock = mfc.sectorToBlock(s);
@@ -361,10 +468,7 @@ public class NfcVaultActivity extends Activity {
 
             // Try GET_VERSION command (0x60) for exact chip identification
             try {
-                NfcA a = NfcA.get(tag);
-                if (a != null) {
-                    a.connect();
-                    byte[] verResp = a.transceive(new byte[]{(byte) 0x60});
+                byte[] verResp = mfu.transceive(new byte[]{(byte) 0x60});
                     if (verResp != null && verResp.length >= 8) {
                         card.put("chipVendor", verResp[1] == 0x04 ? "NXP" : "0x" + String.format("%02X", verResp[1]));
                         card.put("chipType", "0x" + String.format("%02X", verResp[2]));
@@ -383,8 +487,6 @@ public class NfcVaultActivity extends Activity {
                             card.put("tagType", exactType);
                         }
                     }
-                    a.close();
-                }
             } catch (Exception ignored) {
                 // GET_VERSION not supported — fall back to CC detection
             }
@@ -427,6 +529,7 @@ public class NfcVaultActivity extends Activity {
             Ndef ndefTech = Ndef.get(tag);
             if (ndefTech != null) {
                 try {
+                    mfu.close();
                     ndefTech.connect();
                     NdefMessage msg = ndefTech.getNdefMessage();
                     if (msg != null) {
@@ -783,38 +886,12 @@ public class NfcVaultActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        // If no AIDs found via parsing, try well-known AIDs
-        if (aids.length() == 0) {
-            aids = tryWellKnownAids();
-        }
-        return aids;
-    }
-
-    /** Try common payment AIDs when PPSE parsing fails */
-    private JSONArray tryWellKnownAids() {
-        JSONArray aids = new JSONArray();
-        String[][] knownAids = {
-            {"A0000000031010", "Visa"},
-            {"A0000000041010", "Mastercard"},
-            {"A000000025010801", "Amex"},
-            {"A0000001523010", "Discover"},
-            {"A0000003241010", "UnionPay"},
-            {"D5280050218002", "girocard"},
-        };
-        for (String[] entry : knownAids) {
-            try {
-                JSONObject o = new JSONObject();
-                o.put("aid", entry[0]);
-                o.put("network", entry[1]);
-                aids.put(o);
-            } catch (Exception ignored) {}
-        }
         return aids;
     }
 
     /** Identify payment network from AID prefix */
     private String identifyPaymentNetwork(String aid) {
-        String upper = aid.toUpperCase();
+        String upper = aid.toUpperCase(Locale.ROOT);
         if (upper.startsWith("A000000003")) return "Visa";
         if (upper.startsWith("A000000004")) return "Mastercard";
         if (upper.startsWith("A000000025")) return "American Express";
@@ -1043,7 +1120,7 @@ public class NfcVaultActivity extends Activity {
 
     /** Identify FeliCa system from system code */
     private String identifyFelicaSystem(String scHex) {
-        String upper = scHex.toUpperCase();
+        String upper = scHex.toUpperCase(Locale.ROOT);
         if (upper.equals("88B4")) return "NDEF on FeliCa";
         if (upper.equals("8008")) return "FeliCa Lite / Lite-S";
         if (upper.equals("8B5C")) return "FeliCa Standard (NFC-F)";
@@ -1187,117 +1264,6 @@ public class NfcVaultActivity extends Activity {
     }
 
     // ========================================================================
-    //  WRITE CARD
-    // ========================================================================
-    private void writeCard(Tag tag) {
-        try {
-            JSONObject card = new JSONObject(pendingWriteJson);
-            String cardType = card.optString("cardType");
-
-            if ("mifare_classic".equals(cardType)) {
-                MifareClassic mfc = MifareClassic.get(tag);
-                if (mfc == null) {
-                    notifyJS("onWriteError", "Target is not a MIFARE Classic card.");
-                    return;
-                }
-                writeMifareClassic(mfc, card);
-            } else if ("mifare_ultralight".equals(cardType)) {
-                MifareUltralight mfu = MifareUltralight.get(tag);
-                if (mfu == null) {
-                    notifyJS("onWriteError", "Target is not an NTAG/Ultralight card.");
-                    return;
-                }
-                writeMifareUltralight(mfu, card);
-            } else {
-                notifyJS("onWriteError", "Write not supported for this card type.");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Write error", e);
-            notifyJS("onWriteError", e.getMessage() != null ? e.getMessage() : "Write failed");
-        }
-    }
-
-    private void writeMifareClassic(MifareClassic mfc, JSONObject card) throws Exception {
-        try {
-            mfc.connect();
-            JSONArray sectors = card.getJSONArray("sectors");
-            int written = 0, failed = 0;
-
-            for (int i = 0; i < sectors.length(); i++) {
-                JSONObject sector = sectors.getJSONObject(i);
-                int s = sector.getInt("sector");
-                if (!sector.getBoolean("accessible")) { failed++; continue; }
-
-                boolean authOk = false;
-                for (byte[] key : KEY_DICT) {
-                    try {
-                        if (mfc.authenticateSectorWithKeyA(s, key)) { authOk = true; break; }
-                    } catch (IOException ignored) {}
-                    try {
-                        if (mfc.authenticateSectorWithKeyB(s, key)) { authOk = true; break; }
-                    } catch (IOException ignored) {}
-                }
-                if (!authOk) { failed++; continue; }
-
-                JSONArray blocks = sector.getJSONArray("blocks");
-                int firstBlk = mfc.sectorToBlock(s);
-                int blkCount = mfc.getBlockCountInSector(s);
-                for (int b = 0; b < blkCount - 1; b++) {
-                    JSONObject block = blocks.getJSONObject(b);
-                    if (block.getBoolean("isTrailer")) continue;
-                    String hex = block.getString("data").replaceAll("[^0-9A-Fa-f]", "");
-                    if (hex.length() < 32) { failed++; continue; }
-                    try {
-                        mfc.writeBlock(firstBlk + b, hexToBytes(hex));
-                        written++;
-                    } catch (IOException e) { failed++; }
-                }
-            }
-
-            JSONObject result = new JSONObject();
-            result.put("written", written);
-            result.put("failed", failed);
-            notifyJS("onWriteComplete", result.toString());
-        } finally {
-            try { mfc.close(); } catch (IOException ignored) {}
-            writeMode = false;
-            pendingWriteJson = null;
-        }
-    }
-
-    private void writeMifareUltralight(MifareUltralight mfu, JSONObject card) throws Exception {
-        try {
-            mfu.connect();
-            JSONArray pages = card.getJSONArray("pages");
-            int written = 0, failed = 0;
-
-            for (int i = 0; i < pages.length(); i++) {
-                JSONObject page = pages.getJSONObject(i);
-                int p = page.getInt("page");
-                // Skip OTP, Lock bits, and manufacturer block (Pages 0-3 usually shouldn't be written blindly)
-                if (p < 4) continue; 
-                
-                String hex = page.getString("data").replaceAll("[^0-9A-Fa-f]", "");
-                if (hex.length() < 8) { failed++; continue; } // NTAG page is 4 bytes (8 hex chars)
-                
-                try {
-                    mfu.writePage(p, hexToBytes(hex.substring(0, 8)));
-                    written++;
-                } catch (IOException e) { failed++; }
-            }
-
-            JSONObject result = new JSONObject();
-            result.put("written", written);
-            result.put("failed", failed);
-            notifyJS("onWriteComplete", result.toString());
-        } finally {
-            try { mfu.close(); } catch (IOException ignored) {}
-            writeMode = false;
-            pendingWriteJson = null;
-        }
-    }
-
-    // ========================================================================
     //  NDEF WRITER — write URL / Text / Tel / Email / Geo / MIME / AAR tags
     // ========================================================================
     /** Build an NdefMessage from a JSON array of record specs. */
@@ -1307,7 +1273,7 @@ public class NfcVaultActivity extends Activity {
         NdefRecord[] recs = new NdefRecord[arr.length()];
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.getJSONObject(i);
-            String type = o.optString("type", "text").toLowerCase();
+            String type = o.optString("type", "text").toLowerCase(Locale.ROOT);
             String value = o.optString("value", "");
             switch (type) {
                 case "uri":
@@ -1368,11 +1334,18 @@ public class NfcVaultActivity extends Activity {
                         return;
                     }
                     ndef.writeNdefMessage(msg);
+                    NdefMessage verifiedMessage = ndef.getNdefMessage();
+                    if (verifiedMessage == null
+                            || !Arrays.equals(bytes, verifiedMessage.toByteArray())) {
+                        notifyJS("onWriteError", "The tag could not be verified after writing");
+                        return;
+                    }
                     JSONObject result = new JSONObject();
                     result.put("mode", "ndef");
                     result.put("written", msg.getRecords().length);
                     result.put("bytes", bytes.length);
                     result.put("tag", "NDEF");
+                    result.put("verified", true);
                     notifyJS("onWriteComplete", result.toString());
                     return;
                 } finally {
@@ -1415,16 +1388,6 @@ public class NfcVaultActivity extends Activity {
     private class NfcBridge {
         @JavascriptInterface
         public void startReadMode() {
-            writeMode = false;
-            pendingWriteJson = null;
-            ndefWriteMode = false;
-            pendingNdefBytes = null;
-        }
-
-        @JavascriptInterface
-        public void startWriteMode(String cardJson) {
-            pendingWriteJson = cardJson;
-            writeMode = true;
             ndefWriteMode = false;
             pendingNdefBytes = null;
         }
@@ -1435,8 +1398,6 @@ public class NfcVaultActivity extends Activity {
             try {
                 pendingNdefBytes = buildNdefMessage(recordsJson);
                 ndefWriteMode = true;
-                writeMode = false;
-                pendingWriteJson = null;
                 return "" + pendingNdefBytes.length;
             } catch (Exception e) {
                 ndefWriteMode = false;
@@ -1445,10 +1406,30 @@ public class NfcVaultActivity extends Activity {
             }
         }
 
+        /** Queue a previously read standard NDEF message for writing to a compatible tag. */
+        @JavascriptInterface
+        public String startRawNdefWrite(String ndefHex) {
+            try {
+                String clean = ndefHex == null ? "" : ndefHex.replaceAll("[^0-9A-Fa-f]", "");
+                if (clean.length() < 2 || clean.length() % 2 != 0) {
+                    throw new IllegalArgumentException("Invalid NDEF data");
+                }
+                byte[] candidate = hexToBytes(clean);
+                if (candidate.length > 4095) throw new IllegalArgumentException("NDEF data is too large");
+                // Parsing verifies that this is a complete, standards-compliant NDEF message.
+                new NdefMessage(candidate);
+                pendingNdefBytes = candidate;
+                ndefWriteMode = true;
+                return Integer.toString(candidate.length);
+            } catch (Exception e) {
+                ndefWriteMode = false;
+                pendingNdefBytes = null;
+                return "ERR:" + safeMessage(e);
+            }
+        }
+
         @JavascriptInterface
         public void cancelWrite() {
-            writeMode = false;
-            pendingWriteJson = null;
             ndefWriteMode = false;
             pendingNdefBytes = null;
         }
@@ -1476,6 +1457,28 @@ public class NfcVaultActivity extends Activity {
         }
 
         @JavascriptInterface
+        public boolean isEmulationAvailable() {
+            return getPackageManager().hasSystemFeature(
+                    PackageManager.FEATURE_NFC_HOST_CARD_EMULATION);
+        }
+
+        @JavascriptInterface
+        public void openNfcSettings() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(Settings.ACTION_NFC_SETTINGS));
+                } catch (Exception e) {
+                    startActivity(new Intent(Settings.ACTION_WIRELESS_SETTINGS));
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void openExternalUrl(String url) {
+            runOnUiThread(() -> openExternalUri(Uri.parse(url)));
+        }
+
+        @JavascriptInterface
         public void startEmulation(String cardJson) {
             CardEmulationService.setEmulationData(cardJson);
         }
@@ -1486,21 +1489,39 @@ public class NfcVaultActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void exportJson(String fileName, String json) {
+            if (json == null || json.length() > 5_000_000) {
+                notifyJS("onExportComplete", "{\"success\":false,\"message\":\"Export is too large\"}");
+                return;
+            }
+            pendingExportJson = json;
+            runOnUiThread(() -> {
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/json");
+                intent.putExtra(Intent.EXTRA_TITLE, NfcDataUtils.sanitizeJsonFileName(fileName));
+                try {
+                    startActivityForResult(intent, REQUEST_EXPORT_JSON);
+                } catch (Exception e) {
+                    pendingExportJson = null;
+                    notifyJS("onExportComplete", "{\"success\":false,\"message\":\"No file picker is available\"}");
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void saveData(String key, String value) {
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            prefs.edit().putString(key, value).apply();
+            secureVaultStore.putString(key, value);
         }
 
         @JavascriptInterface
         public String loadData(String key) {
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            return prefs.getString(key, "");
+            return secureVaultStore.getString(key);
         }
 
         @JavascriptInterface
         public void removeData(String key) {
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            prefs.edit().remove(key).apply();
+            secureVaultStore.remove(key);
         }
     }
 
@@ -1508,6 +1529,7 @@ public class NfcVaultActivity extends Activity {
     //  JS NOTIFICATION (thread-safe)
     // ========================================================================
     private void notifyJS(String cb, String data) {
+        if (webView == null || !webViewReady) return;
         String safe = data
             .replace("\\", "\\\\")
             .replace("'", "\\'")
@@ -1515,6 +1537,25 @@ public class NfcVaultActivity extends Activity {
             .replace("\r", "\\r");
         runOnUiThread(() -> webView.evaluateJavascript(
             "window.NfcCallbacks&&window.NfcCallbacks." + cb + "('" + safe + "')", null));
+    }
+
+    private void openExternalUri(Uri uri) {
+        if (uri == null || uri.getScheme() == null) return;
+        String scheme = uri.getScheme().toLowerCase(java.util.Locale.US);
+        if (!Arrays.asList("https", "http", "mailto", "tel", "geo").contains(scheme)) {
+            notifyJS("onReadError", "Blocked unsupported link type");
+            return;
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+        } catch (Exception e) {
+            notifyJS("onReadError", "No app can open this link");
+        }
+    }
+
+    private static String safeMessage(Throwable throwable) {
+        String message = throwable.getMessage();
+        return message == null || message.trim().isEmpty() ? "Unknown error" : message;
     }
 
     // ========================================================================
@@ -1551,13 +1592,7 @@ public class NfcVaultActivity extends Activity {
     }
 
     private static byte[] hexToBytes(String hex) {
-        int len = hex.length();
-        byte[] out = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                                + Character.digit(hex.charAt(i + 1), 16));
-        }
-        return out;
+        return NfcDataUtils.decodeHex(hex);
     }
 
     private static String getManufacturer(int code) {

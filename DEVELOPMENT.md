@@ -1,4 +1,6 @@
-# NFC Vault — Development Documentation
+# NFC Vault — Historical Development Documentation
+
+> **Version 3 note:** This file records earlier implementation phases. Older sections that describe raw card cloning, unencrypted `SharedPreferences`, or “universal” support are historical and no longer describe the app. See [`README.md`](README.md) for the current product, security, compatibility, and build documentation.
 
 > **Universal NFC Reader, Writer & Card Manager for Android**
 > Version 2.0 · Built July 2026

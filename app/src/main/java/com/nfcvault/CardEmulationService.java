@@ -22,10 +22,6 @@ public class CardEmulationService extends HostApduService {
     };
 
     // APDU commands
-    private static final byte[] SELECT_APP_CMD = {
-            0x00, (byte) 0xA4, 0x04, 0x00, 0x07,
-            (byte) 0xD2, 0x76, 0x00, 0x00, (byte) 0x85, 0x01, 0x01, 0x00
-    };
     private static final byte[] SELECT_CC_FILE_CMD = {
             0x00, (byte) 0xA4, 0x00, 0x0C, 0x02, (byte) 0xE1, 0x03
     };
@@ -36,6 +32,9 @@ public class CardEmulationService extends HostApduService {
     // Standard APDU success response
     private static final byte[] SUCCESS_SW = { (byte) 0x90, 0x00 };
     private static final byte[] FAILURE_SW = { 0x6A, (byte) 0x82 };
+    private static final byte[] WRONG_LENGTH_SW = { 0x67, 0x00 };
+    private static final byte[] WRONG_OFFSET_SW = { 0x6B, 0x00 };
+    private static final int MAX_NDEF_SIZE = 4095;
 
     // Capability Container (CC) File data for NDEF Type 4
     private static final byte[] CC_FILE = {
@@ -52,7 +51,7 @@ public class CardEmulationService extends HostApduService {
     };
 
     // NDEF Message (Default empty, updated dynamically)
-    private static byte[] ndefMessage = new byte[0];
+    private static volatile byte[] ndefMessage = new byte[0];
     private boolean ccSelected = false;
     private boolean ndefSelected = false;
 
@@ -68,8 +67,9 @@ public class CardEmulationService extends HostApduService {
             // Preferred: use the exact raw NDEF message captured at read time.
             if (card.has("ndefMessageHex")) {
                 String hex = card.getString("ndefMessageHex").replaceAll("[^0-9A-Fa-f]", "");
-                if (hex.length() >= 2) {
-                    ndefMessage = hexToBytes(hex);
+                if (hex.length() >= 2 && hex.length() % 2 == 0) {
+                    byte[] candidate = hexToBytes(hex);
+                    ndefMessage = candidate.length <= MAX_NDEF_SIZE ? candidate : new byte[0];
                     return;
                 }
             }
@@ -77,7 +77,8 @@ public class CardEmulationService extends HostApduService {
             // Fallback: rebuild an NDEF message from parsed records (URI / TEXT).
             if (card.has("ndefRecords")) {
                 byte[] rebuilt = buildFromRecords(card.getJSONArray("ndefRecords"));
-                ndefMessage = (rebuilt != null) ? rebuilt : new byte[0];
+                ndefMessage = (rebuilt != null && rebuilt.length <= MAX_NDEF_SIZE)
+                        ? rebuilt : new byte[0];
                 return;
             }
 
@@ -114,15 +115,16 @@ public class CardEmulationService extends HostApduService {
     }
 
     public static void setRawNdefMessage(byte[] ndef) {
-        ndefMessage = ndef;
+        ndefMessage = ndef == null || ndef.length > MAX_NDEF_SIZE
+                ? new byte[0] : Arrays.copyOf(ndef, ndef.length);
     }
 
     @Override
     public byte[] processCommandApdu(byte[] commandApdu, Bundle extras) {
-        if (commandApdu == null) return FAILURE_SW;
+        if (commandApdu == null || commandApdu.length < 4) return WRONG_LENGTH_SW;
 
         // SELECT NDEF Application
-        if (Arrays.equals(SELECT_APP_CMD, commandApdu)) {
+        if (isSelectNdefApplication(commandApdu)) {
             ccSelected = false;
             ndefSelected = false;
             return SUCCESS_SW;
@@ -141,11 +143,13 @@ public class CardEmulationService extends HostApduService {
         }
         // READ BINARY
         else if (commandApdu[0] == 0x00 && commandApdu[1] == (byte) 0xB0) {
+            if (commandApdu.length < 5) return WRONG_LENGTH_SW;
             int offset = ((commandApdu[2] & 0xFF) << 8) | (commandApdu[3] & 0xFF);
             int length = commandApdu[4] & 0xFF;
+            if (length == 0) length = 256;
 
             if (ccSelected) {
-                if (offset > CC_FILE.length) return FAILURE_SW;
+                if (offset > CC_FILE.length) return WRONG_OFFSET_SW;
                 length = Math.min(length, CC_FILE.length - offset);
                 byte[] response = new byte[length + 2];
                 System.arraycopy(CC_FILE, offset, response, 0, length);
@@ -153,12 +157,13 @@ public class CardEmulationService extends HostApduService {
                 return response;
             } else if (ndefSelected) {
                 // NDEF File structure: 2 bytes length + NDEF message
-                byte[] ndefFile = new byte[ndefMessage.length + 2];
-                ndefFile[0] = (byte) ((ndefMessage.length >> 8) & 0xFF);
-                ndefFile[1] = (byte) (ndefMessage.length & 0xFF);
-                System.arraycopy(ndefMessage, 0, ndefFile, 2, ndefMessage.length);
+                byte[] messageSnapshot = ndefMessage;
+                byte[] ndefFile = new byte[messageSnapshot.length + 2];
+                ndefFile[0] = (byte) ((messageSnapshot.length >> 8) & 0xFF);
+                ndefFile[1] = (byte) (messageSnapshot.length & 0xFF);
+                System.arraycopy(messageSnapshot, 0, ndefFile, 2, messageSnapshot.length);
 
-                if (offset > ndefFile.length) return FAILURE_SW;
+                if (offset > ndefFile.length) return WRONG_OFFSET_SW;
                 length = Math.min(length, ndefFile.length - offset);
                 byte[] response = new byte[length + 2];
                 System.arraycopy(ndefFile, offset, response, 0, length);
@@ -170,6 +175,17 @@ public class CardEmulationService extends HostApduService {
         return FAILURE_SW;
     }
 
+    private static boolean isSelectNdefApplication(byte[] command) {
+        if (command.length != 12 && command.length != 13) return false;
+        if (command[0] != 0x00 || command[1] != (byte) 0xA4
+                || command[2] != 0x04 || command[3] != 0x00
+                || (command[4] & 0xFF) != NDEF_AID.length) return false;
+        for (int i = 0; i < NDEF_AID.length; i++) {
+            if (command[5 + i] != NDEF_AID[i]) return false;
+        }
+        return command.length == 12 || command[12] == 0x00;
+    }
+
     @Override
     public void onDeactivated(int reason) {
         ccSelected = false;
@@ -177,12 +193,6 @@ public class CardEmulationService extends HostApduService {
     }
 
     private static byte[] hexToBytes(String hex) {
-        int len = hex.length();
-        byte[] out = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                    + Character.digit(hex.charAt(i + 1), 16));
-        }
-        return out;
+        return NfcDataUtils.decodeHex(hex);
     }
 }

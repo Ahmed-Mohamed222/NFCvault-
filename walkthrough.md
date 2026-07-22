@@ -1,32 +1,41 @@
-# Feature Update: Phone as Card, Writing NTAGs, and Offline Mode
+# NFC Vault v3 Walkthrough
 
-I have successfully implemented all the features outlined in the implementation plan. The app is now significantly more powerful and fully standalone. 
+## Home and scanning
 
-## 1. Phone as Card (Host Card Emulation) 📡
+Open **Home** and choose **Start NFC scan**. Hold the card or tag near the back of the phone and move it slowly until detection completes. The result explains the detected NFC technology, publicly readable data, and which actions are actually available.
 
-You can now use your phone to emulate a card!
+If NFC is disabled, use **Turn on NFC** to open the Android NFC settings. Cards may also be detected automatically while NFC Vault is open.
 
-- **How it works:** I added a `CardEmulationService` that uses Android's Host Card Emulation (HCE) API. 
-- **What it emulates:** The app will emulate an **NDEF Type 4 Tag** (ISO-DEP). This means you can save an NDEF card (like a URL or text tag) in the app, click **Emulate**, and then hold your phone up to *another* smartphone or NFC reader, and it will read the data just as if you were holding a physical NFC tag.
-- **UI Update:** The Detail Panel for saved cards now features a 📡 **Emulate** button. While emulating, the button turns red to let you stop the emulation.
+## Saving and organizing
 
-> [!IMPORTANT]
-> Because of Android hardware limitations, the phone cannot emulate physical MIFARE Classic cards (the proprietary protocol used for older transit or hotel keys). It exclusively emulates standardized ISO-DEP protocol tags.
+Choose **Save securely** to add an item to the encrypted on-device vault. In **Vault**, you can search by name, serial, manufacturer, or technology and filter by category.
 
-## 2. NTAG / MIFARE Ultralight Write Support ✍️
+Supported categories include access, transit, payment, hotel keys, identity, loyalty, tickets, health, mobility, smart home, NFC tags, product/asset tags, and other items. A category is organizational metadata—it does not grant access to protected card data.
 
-Previously, you could only clone MIFARE Classic cards. Now you can write to the extremely popular **NTAG** and **MIFARE Ultralight** family of cards!
+Use **Rename** or the category selector to improve organization. Import and export use Android's system document picker and JSON files. Exported JSON is not encrypted, so store it carefully.
 
-- **Implementation:** The native `writeCard` method now routes the cloning process based on the card type. For NTAGs, it loops through the card's 4-byte pages and precisely writes the hex data using the `MifareUltralight.writePage()` API.
-- **Safety:** The writer is smart enough to skip the critical first 4 pages (Manufacturer Data, OTP, and Lock Bits) to prevent accidentally permanently locking or bricking a blank tag during a clone attempt.
+## Creating an NFC tag
 
-## 3. Fully Offline Web App 🌐 -> 📦
+Open **Create**, select a record type, and enter its content. NFC Vault can create links, text notes, phone and email actions, map locations, and vCards. Choose **Continue to phone scan**, then hold a compatible writable NDEF tag near the phone.
 
-The React frontend has been upgraded to run completely offline. 
+For an existing saved item with a standard NDEF message, choose **Copy NDEF**. This copies the public NDEF content only; it does not clone secure access, payment, hotel, identity, or transit credentials.
 
-- **Before:** The app relied on `cdnjs.cloudflare.com` to download the React and Babel frameworks on launch. If you were offline on the first launch, the UI wouldn't load.
-- **Now:** I downloaded the minified production versions of `react.production.min.js`, `react-dom.production.min.js`, and `babel.min.js` directly into the app's `assets/www/lib/` folder. The app is now 100% self-contained and guarantees it will run instantly in a Faraday cage or deep underground.
+Normal NDEF writes are read back and compared before success is reported. Blank NDEF-formatable tags are formatted when Android supports them.
 
-## Next Steps
+## Sharing by phone
 
-The APK was successfully rebuilt. You can install it on your device and test the new "Emulate" button with another phone, or try cloning a card onto a blank NTAG sticker!
+On devices with Android Host Card Emulation, eligible non-secure NDEF items show **Share by phone**. This presents the standard NDEF message as an NFC Forum Type 4 Tag while the device is unlocked. It is useful for links, contact cards, notes, and similar content.
+
+This feature does not emulate bank cards, MIFARE Classic credentials, DESFire applications, hotel keys, transit passes, or other protected credentials.
+
+## Accessibility and compatibility
+
+Open **Guide** for the compatibility matrix and the following display controls:
+
+- Larger text
+- High contrast
+- Reduced motion
+
+The interface also provides labeled controls, visible keyboard focus, screen-reader status announcements, large touch targets, and information that does not rely on color alone.
+
+Physical-device testing is still essential. Antenna position, NFC chipset support, Android version, issuer security, and tag condition all affect real-world behavior.
