@@ -10,8 +10,8 @@ android {
         applicationId = "com.nfcvault"
         minSdk = 23
         targetSdk = 34
-        versionCode = 5
-        versionName = "3.1.1"
+        versionCode = 6
+        versionName = "3.1.2"
     }
 
     buildTypes {
