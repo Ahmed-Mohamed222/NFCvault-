@@ -1,0 +1,7 @@
+{
+  "name": "nfc-vault-web-assets",
+  "private": true,
+  "scripts": {
+    "build:web": "node scripts/build-web.mjs"
+  }
+}

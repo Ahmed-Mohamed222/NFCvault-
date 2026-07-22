@@ -34,6 +34,17 @@ Requirements:
 
 - JDK 11 or newer
 - Android SDK Platform 34 and Build Tools 34.0.0
+- Node.js and npm only when changing the web interface source
+
+The editable React/JSX source is `web-src/app.jsx`. After changing it, rebuild the
+committed Android asset before running Gradle:
+
+```powershell
+npm run build:web
+```
+
+The installed application loads the precompiled `assets/www/app.js`; it does not ship
+the JSX compiler or evaluate source code at runtime.
 
 On Windows:
 
@@ -64,7 +75,9 @@ Production releases require a private signing configuration supplied by the appl
 - `SecureVaultStore`: AES-GCM encryption backed by Android Keystore.
 - `CardEmulationService`: crash-safe NFC Forum Type 4 NDEF HCE service.
 - `NfcDataUtils`: validated hex decoding and safe JSON filenames.
-- `assets/www/index.html`: self-contained responsive React interface; no network-loaded resources.
+- `web-src/app.jsx`: editable React interface source.
+- `assets/www/app.js`: precompiled, minified interface committed for Android packaging.
+- `assets/www/index.html`: offline interface shell with a strict no-eval content security policy.
 
 ## Testing notes
 
