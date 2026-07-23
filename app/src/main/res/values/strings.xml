@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">NFC Vault</string>
+    <string name="lock_prompt_title">Unlock NFC Vault</string>
+    <string name="lock_prompt_desc">Confirm your screen lock to open your vault</string>
 </resources>

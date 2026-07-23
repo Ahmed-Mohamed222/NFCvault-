@@ -10,6 +10,7 @@ NFC Vault is an offline Android application for inspecting compatible NFC cards 
 - Saved-card copying: choose a saved source from the vault, scan a compatible writable destination, and copy its standards-compliant public NDEF message with read-back verification where Android supports it.
 - NDEF sharing: eligible non-secure NDEF content can be presented as an NFC Forum Type 4 Tag on devices with HCE.
 - Encrypted local storage using AES-GCM and an Android Keystore-held key.
+- Optional app lock: require the device PIN, pattern, or password before the vault is shown, locking on every cold start and after a configurable background timeout.
 - JSON import/export using Android's system document picker.
 - Larger-text, high-contrast, reduced-motion, screen-reader, and keyboard-focus support.
 
@@ -26,6 +27,7 @@ Phones also cannot read low-frequency RFID, UHF RFID, Bluetooth-only, or UWB-onl
 - Saved data is encrypted before being written to app preferences.
 - Android cloud backup and device-transfer backup are disabled for all app data.
 - HCE requires the device to be unlocked and is limited to standard NDEF content.
+- The optional app lock authenticates through the system Keyguard using the device PIN, pattern, or password; NFC Vault never stores that credential or a separate PIN. While locked it hides the vault and refuses saved-card reads or changes, imports, exports, NFC scans and writes, clipboard copying, and starting NDEF sharing. It self-disables if the device has no screen lock, so it can never lock you out.
 - Only public NFC Forum/default MIFARE keys are tried; issuer-specific keys are not included.
 
 ## Build

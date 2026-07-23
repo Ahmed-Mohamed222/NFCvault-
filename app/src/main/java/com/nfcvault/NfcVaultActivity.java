@@ -1,6 +1,7 @@
 package com.nfcvault;
 
 import android.app.Activity;
+import android.app.KeyguardManager;
 import android.app.PendingIntent;
 import android.annotation.SuppressLint;
 import android.content.ClipData;
@@ -27,6 +28,7 @@ import android.nfc.tech.NfcF;
 import android.nfc.tech.NfcV;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
@@ -53,6 +55,12 @@ public class NfcVaultActivity extends Activity {
     private static final String TAG = "NfcVault";
     private static final int REQUEST_OPEN_FILE = 7001;
     private static final int REQUEST_EXPORT_JSON = 7002;
+    private static final int REQUEST_UNLOCK = 7003;
+    // App-lock config lives in the encrypted store; the activity owns lock state for lifecycle gating.
+    private static final String LOCK_PREF_KEY = "nfc_vault_lock_config_v1";
+    // Must match CARD_KEY / LEGACY_CARD_KEY in web-src/app.jsx: the only bridge values held back while locked.
+    private static final String CARDS_KEY = "nfc_saved_cards_v3";
+    private static final String LEGACY_CARDS_KEY = "nfc_saved_cards";
 
     // Public NFC Forum/default keys only. NFC Vault does not probe issuer-specific keys.
     private static final byte[][] KEY_DICT = {
@@ -74,6 +82,13 @@ public class NfcVaultActivity extends Activity {
     private ValueCallback<Uri[]> fileChooserCallback;
     private String pendingExportJson;
 
+    private KeyguardManager keyguardManager;
+    private volatile boolean appLockEnabled = false;
+    private int lockTimeoutSeconds = 0;
+    private volatile boolean locked = false;
+    private long backgroundedAt = 0;            // elapsedRealtime at onStop; 0 = not backgrounded
+    private boolean internalActivityLaunch = false; // our own picker/settings/unlock, not a real backgrounding
+
     @Override
     @SuppressLint("SetJavaScriptEnabled")
     protected void onCreate(Bundle savedInstanceState) {
@@ -82,6 +97,9 @@ public class NfcVaultActivity extends Activity {
 
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
         secureVaultStore = new SecureVaultStore(this);
+        keyguardManager = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+        loadLockConfig();
+        locked = lockActive(); // a fresh process always starts locked when the lock is armed
 
         webView = findViewById(R.id.webView);
         WebSettings ws = webView.getSettings();
@@ -99,6 +117,7 @@ public class NfcVaultActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 webViewReady = true;
+                pushLockState(); // first onResume ran before the page was ready
                 handleIntent(getIntent());
             }
 
@@ -125,15 +144,21 @@ public class NfcVaultActivity extends Activity {
                     WebView view,
                     ValueCallback<Uri[]> callback,
                     FileChooserParams params) {
+                if (locked) {
+                    callback.onReceiveValue(null);
+                    return true;
+                }
                 if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
                 fileChooserCallback = callback;
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
                 intent.setType("application/json");
                 try {
+                    internalActivityLaunch = true;
                     startActivityForResult(intent, REQUEST_OPEN_FILE);
                     return true;
                 } catch (Exception e) {
+                    internalActivityLaunch = false;
                     fileChooserCallback = null;
                     return false;
                 }
@@ -167,6 +192,17 @@ public class NfcVaultActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_UNLOCK) {
+            if (resultCode == RESULT_OK) {
+                locked = false;
+                backgroundedAt = 0;
+                notifyJS("onUnlockResult", "success");
+            } else {
+                notifyJS("onUnlockResult", "cancelled");
+            }
+            // onResume runs next and calls pushLockState(); it also clears internalActivityLaunch.
+            return;
+        }
         if (requestCode == REQUEST_OPEN_FILE) {
             if (fileChooserCallback != null) {
                 Uri[] result = null;
@@ -227,6 +263,7 @@ public class NfcVaultActivity extends Activity {
             notifyJS("onNfcStatus", nfcAdapter == null
                     ? "unavailable" : (nfcAdapter.isEnabled() ? "ready" : "disabled"));
         }
+        evaluateLockOnResume();
     }
 
     @Override
@@ -238,9 +275,80 @@ public class NfcVaultActivity extends Activity {
     }
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        backgroundedAt = SystemClock.elapsedRealtime();
+    }
+
+    // ========================================================================
+    //  APP LOCK — device credential gate (device Keyguard handles auth UI)
+    // ========================================================================
+    /** The lock only applies when the user armed it AND a device screen lock exists to authenticate against. */
+    private boolean lockActive() {
+        return appLockEnabled && keyguardManager != null && keyguardManager.isDeviceSecure();
+    }
+
+    private void loadLockConfig() {
+        try {
+            String raw = secureVaultStore.getString(LOCK_PREF_KEY);
+            if (raw != null && !raw.isEmpty()) {
+                JSONObject o = new JSONObject(raw);
+                appLockEnabled = o.optBoolean("enabled", false);
+                lockTimeoutSeconds = Math.max(0, o.optInt("timeout", 0));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Unable to read lock config", e);
+        }
+    }
+
+    private void evaluateLockOnResume() {
+        if (!lockActive()) {
+            locked = false;                 // disabled or device lock removed: never strand the user
+        } else if (internalActivityLaunch) {
+            // returning from our own picker/settings/unlock — keep the current lock state
+        } else if (backgroundedAt > 0
+                && SystemClock.elapsedRealtime() - backgroundedAt >= lockTimeoutSeconds * 1000L) {
+            locked = true;
+        }
+        internalActivityLaunch = false;
+        backgroundedAt = 0;
+        if (locked) cancelPendingWrite();
+        pushLockState();
+    }
+
+    private void cancelPendingWrite() {
+        ndefWriteMode = false;
+        pendingNdefBytes = null;
+    }
+
+    private void pushLockState() {
+        if (webViewReady) notifyJS("onLockState", locked ? "locked" : "unlocked");
+    }
+
+    /** Launch the system confirm-credential screen; result arrives in onActivityResult. */
+    private void launchUnlock() {
+        if (!lockActive()) { locked = false; pushLockState(); return; }
+        // ponytail: deprecated in API 29 but the only zero-dependency call spanning API 23–34.
+        //           It confirms the device PIN, pattern, or password through the system UI.
+        //           Upgrade path: androidx.biometric BiometricPrompt (needs FragmentActivity).
+        Intent intent = keyguardManager.createConfirmDeviceCredentialIntent(
+                getString(R.string.lock_prompt_title), getString(R.string.lock_prompt_desc));
+        if (intent == null) { locked = false; pushLockState(); return; }
+        try {
+            internalActivityLaunch = true;
+            startActivityForResult(intent, REQUEST_UNLOCK);
+        } catch (Exception e) {
+            internalActivityLaunch = false;
+            notifyJS("onUnlockResult", "error");
+        }
+    }
+
+    @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        // NFC may relaunch a stopped activity before onResume has applied the timeout.
+        evaluateLockOnResume();
         handleIntent(intent);
     }
 
@@ -250,6 +358,13 @@ public class NfcVaultActivity extends Activity {
         if (!NfcAdapter.ACTION_TECH_DISCOVERED.equals(action) &&
             !NfcAdapter.ACTION_TAG_DISCOVERED.equals(action) &&
             !NfcAdapter.ACTION_NDEF_DISCOVERED.equals(action)) return;
+
+        // Consume NFC launch intents while locked so they cannot run after a later unlock.
+        if (locked) {
+            intent.setAction(null);
+            cancelPendingWrite();
+            return;
+        }
 
         Tag tag;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1404,6 +1519,7 @@ public class NfcVaultActivity extends Activity {
         /** Queue an NDEF message (built from a JSON record spec) to write to the next tag. */
         @JavascriptInterface
         public String startNdefWrite(String recordsJson) {
+            if (locked) return "ERR:Vault is locked";
             try {
                 pendingNdefBytes = buildNdefMessage(recordsJson);
                 ndefWriteMode = true;
@@ -1418,6 +1534,7 @@ public class NfcVaultActivity extends Activity {
         /** Queue a previously read standard NDEF message for writing to a compatible tag. */
         @JavascriptInterface
         public String startRawNdefWrite(String ndefHex) {
+            if (locked) return "ERR:Vault is locked";
             try {
                 String clean = ndefHex == null ? "" : ndefHex.replaceAll("[^0-9A-Fa-f]", "");
                 if (clean.length() < 2 || clean.length() % 2 != 0) {
@@ -1439,12 +1556,12 @@ public class NfcVaultActivity extends Activity {
 
         @JavascriptInterface
         public void cancelWrite() {
-            ndefWriteMode = false;
-            pendingNdefBytes = null;
+            cancelPendingWrite();
         }
 
         @JavascriptInterface
         public void copyToClipboard(String text) {
+            if (locked) return;
             runOnUiThread(() -> {
                 try {
                     ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
@@ -1474,6 +1591,7 @@ public class NfcVaultActivity extends Activity {
         @JavascriptInterface
         public void openNfcSettings() {
             runOnUiThread(() -> {
+                internalActivityLaunch = true;
                 try {
                     startActivity(new Intent(Settings.ACTION_NFC_SETTINGS));
                 } catch (Exception e) {
@@ -1483,12 +1601,59 @@ public class NfcVaultActivity extends Activity {
         }
 
         @JavascriptInterface
+        public boolean isDeviceSecure() {
+            return keyguardManager != null && keyguardManager.isDeviceSecure();
+        }
+
+        @JavascriptInterface
+        public boolean isLocked() {
+            return locked;
+        }
+
+        /** {enabled,timeout,deviceSecure,locked} so the UI can render the current lock setting. */
+        @JavascriptInterface
+        public String getLockConfig() {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("enabled", appLockEnabled);
+                o.put("timeout", lockTimeoutSeconds);
+                o.put("deviceSecure", keyguardManager != null && keyguardManager.isDeviceSecure());
+                o.put("locked", locked);
+                return o.toString();
+            } catch (Exception e) {
+                return "{}";
+            }
+        }
+
+        @JavascriptInterface
+        public void setLockConfig(boolean enabled, int timeoutSeconds) {
+            if (locked) return;
+            appLockEnabled = enabled && keyguardManager != null && keyguardManager.isDeviceSecure();
+            lockTimeoutSeconds = Math.max(0, timeoutSeconds);
+            if (!appLockEnabled) locked = false;
+            try {
+                JSONObject o = new JSONObject();
+                o.put("enabled", appLockEnabled);
+                o.put("timeout", lockTimeoutSeconds);
+                secureVaultStore.putString(LOCK_PREF_KEY, o.toString());
+            } catch (Exception e) {
+                Log.e(TAG, "Unable to save lock config", e);
+            }
+        }
+
+        @JavascriptInterface
+        public void requestUnlock() {
+            runOnUiThread(NfcVaultActivity.this::launchUnlock);
+        }
+
+        @JavascriptInterface
         public void openExternalUrl(String url) {
             runOnUiThread(() -> openExternalUri(Uri.parse(url)));
         }
 
         @JavascriptInterface
         public void startEmulation(String cardJson) {
+            if (locked) return;
             CardEmulationService.setEmulationData(cardJson);
         }
 
@@ -1499,6 +1664,10 @@ public class NfcVaultActivity extends Activity {
 
         @JavascriptInterface
         public void exportJson(String fileName, String json) {
+            if (locked) {
+                notifyJS("onExportComplete", "{\"success\":false,\"message\":\"Unlock the vault to export\"}");
+                return;
+            }
             if (json == null || json.length() > 5_000_000) {
                 notifyJS("onExportComplete", "{\"success\":false,\"message\":\"Export is too large\"}");
                 return;
@@ -1510,8 +1679,10 @@ public class NfcVaultActivity extends Activity {
                 intent.setType("application/json");
                 intent.putExtra(Intent.EXTRA_TITLE, NfcDataUtils.sanitizeJsonFileName(fileName));
                 try {
+                    internalActivityLaunch = true;
                     startActivityForResult(intent, REQUEST_EXPORT_JSON);
                 } catch (Exception e) {
+                    internalActivityLaunch = false;
                     pendingExportJson = null;
                     notifyJS("onExportComplete", "{\"success\":false,\"message\":\"No file picker is available\"}");
                 }
@@ -1520,16 +1691,20 @@ public class NfcVaultActivity extends Activity {
 
         @JavascriptInterface
         public void saveData(String key, String value) {
+            if (locked && (CARDS_KEY.equals(key) || LEGACY_CARDS_KEY.equals(key))) return;
             secureVaultStore.putString(key, value);
         }
 
         @JavascriptInterface
         public String loadData(String key) {
+            // Hold back saved-card data while locked; UI prefs (theme, text size) still load.
+            if (locked && (CARDS_KEY.equals(key) || LEGACY_CARDS_KEY.equals(key))) return "";
             return secureVaultStore.getString(key);
         }
 
         @JavascriptInterface
         public void removeData(String key) {
+            if (locked && (CARDS_KEY.equals(key) || LEGACY_CARDS_KEY.equals(key))) return;
             secureVaultStore.remove(key);
         }
     }
